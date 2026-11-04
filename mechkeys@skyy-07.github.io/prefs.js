@@ -1,5 +1,5 @@
 import {ExtensionPreferences, gettext as _}
-    from 'resource:///org/gnome/shell/extensions/prefs.js';
+    from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
 import Adw from 'gi://Adw';
 import Gdk from 'gi://Gdk';
