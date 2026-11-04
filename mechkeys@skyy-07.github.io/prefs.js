@@ -164,8 +164,31 @@ export default class MechKeysPreferences extends ExtensionPreferences {
                 GLib.find_program_in_path('paplay');
             if (!pw)
                 return;
-            const path = GLib.build_filenamev([EXT_DIR, 'sounds',
+            let path = GLib.build_filenamev([EXT_DIR, 'sounds',
                 settings.get_string('profile'), 'press-1.wav']);
+            if (!GLib.file_test(path, GLib.FileTest.EXISTS)) {
+                const packCacheDir = GLib.build_filenamev(
+                    [GLib.get_user_cache_dir(), 'mechkeys', 'packs']);
+                let found = null;
+                try {
+                    const dir = Gio.File.new_for_path(packCacheDir);
+                    const enumerator = dir.enumerate_children(
+                        'standard::name', Gio.FileQueryInfoFlags.NONE, null);
+                    let info;
+                    while ((info = enumerator.next_file(null)) !== null) {
+                        const testKey = GLib.build_filenamev(
+                            [packCacheDir, info.get_name(), 'KeyA-1.wav']);
+                        if (GLib.file_test(testKey, GLib.FileTest.EXISTS)) {
+                            found = testKey;
+                            break;
+                        }
+                    }
+                } catch {
+                    // cache not ready
+                }
+                path = found ?? GLib.build_filenamev(
+                    [EXT_DIR, 'sounds', 'thock', 'press-1.wav']);
+            }
             const proc = new Gio.Subprocess({
                 argv: [pw, '--volume', settings.get_double('volume').toFixed(2), path],
                 flags: Gio.SubprocessFlags.NONE,
@@ -220,7 +243,10 @@ export default class MechKeysPreferences extends ExtensionPreferences {
     }
 
     _bindString(settings, key, title, subtitle, placeholder) {
-        const row = new Adw.EntryRow({title, subtitle});
+        const row = new Adw.EntryRow({
+            title,
+            tooltip_text: subtitle ?? '',
+        });
         let guard = false;
         const applyFromKey = () => {
             if (guard)

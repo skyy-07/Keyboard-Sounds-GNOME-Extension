@@ -224,9 +224,18 @@ class Args:
     def _setattr(self, key):
         arg = key.replace('-', '_')
         if self._s is not None:
-            t = self._s.get_value(key).get_type_string()
-            val = getattr(self._s, {'.d': 'get_double', '.b': 'get_boolean',
-                                    '.s': 'get_string'}[t])(key)
+            t = self._s.get_value(key).get_type_string().lstrip('.')
+            getter = {
+                'd': 'get_double',
+                'b': 'get_boolean',
+                's': 'get_string',
+                'i': 'get_int',
+                'u': 'get_uint',
+            }.get(t)
+            if getter and hasattr(self._s, getter):
+                val = getattr(self._s, getter)(key)
+            else:
+                val = self.FALLBACK[key]
         else:
             val = self.FALLBACK[key]
         setattr(self, arg, val)
@@ -316,7 +325,10 @@ class Player:
         if path is None:
             return
 
-        argv = [self.binary, '--volume', f'{vol:.4f}', path]
+        argv = [self.binary, '--volume', f'{vol:.4f}']
+        if os.path.basename(self.binary) == 'pw-play':
+            argv.extend(['--latency', '10ms'])
+        argv.append(path)
         # recycle finished players
         self.players = [p for p in self.players if p.poll() is None]
         if len(self.players) >= 10:  # too much already in flight

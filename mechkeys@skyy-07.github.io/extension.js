@@ -110,8 +110,31 @@ export default class MechKeysExtension extends Extension {
         try {
             const volume = this._settings.get_double('volume');
             const profile = this._settings.get_string('profile');
-            const path = GLib.build_filenamev(
+            let path = GLib.build_filenamev(
                 [this.path, 'sounds', profile, 'press-1.wav']);
+            if (!GLib.file_test(path, GLib.FileTest.EXISTS)) {
+                const packCacheDir = GLib.build_filenamev(
+                    [GLib.get_user_cache_dir(), 'mechkeys', 'packs']);
+                let found = null;
+                try {
+                    const dir = Gio.File.new_for_path(packCacheDir);
+                    const enumerator = dir.enumerate_children(
+                        'standard::name', Gio.FileQueryInfoFlags.NONE, null);
+                    let info;
+                    while ((info = enumerator.next_file(null)) !== null) {
+                        const testKey = GLib.build_filenamev(
+                            [packCacheDir, info.get_name(), 'KeyA-1.wav']);
+                        if (GLib.file_test(testKey, GLib.FileTest.EXISTS)) {
+                            found = testKey;
+                            break;
+                        }
+                    }
+                } catch {
+                    // cache not ready
+                }
+                path = found ?? GLib.build_filenamev(
+                    [this.path, 'sounds', 'thock', 'press-1.wav']);
+            }
             const pw = GLib.find_program_in_path('pw-play') ??
                 GLib.find_program_in_path('paplay');
             if (!pw)
