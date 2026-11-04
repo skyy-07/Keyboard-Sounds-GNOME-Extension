@@ -12,10 +12,16 @@
         <choice value="thock"/>
         <choice value="clack"/>
         <choice value="creamy"/>
+        <choice value="pack"/>
       </choices>
       <default>"thock"</default>
       <summary>Sound profile</summary>
-      <description>Character of the synthesized clicks.</description>
+      <description>Character of the synthesized clicks, or a custom MechVibes-style pack.</description>
+    </key>
+    <key name="pack-name" type="s">
+      <default>"r1-36ef0a69"</default>
+      <summary>Custom pack name</summary>
+      <description>Folder under ~/.local/share/mechkeys/packs/ holding config.json and concatenated_audio.wav (used when profile is "pack").</description>
     </key>
     <key name="pitch-variation" type="b">
       <default>true</default>

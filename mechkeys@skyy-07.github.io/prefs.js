@@ -1,5 +1,5 @@
 import {ExtensionPreferences, gettext as _}
-    from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
+    from 'resource:///org/gnome/shell/extensions/prefs.js';
 
 import Adw from 'gi://Adw';
 import Gdk from 'gi://Gdk';
@@ -67,9 +67,9 @@ export default class MechKeysPreferences extends ExtensionPreferences {
         const group = new Adw.PreferencesGroup({title: _('Sound')});
 
         // -- sound profile ------------------------------------------
-        const profiles = ['thock', 'clack', 'creamy'];
+        const profiles = ['thock', 'clack', 'creamy', 'pack'];
         const labels = ['Thock (deep & rounded)', 'Clack (bright & snappy)',
-            'Creamy (soft & muted)'];
+            'Creamy (soft & muted)', 'Custom pack (MechVibes sounds)'];
         const list = new Gtk.StringList();
         labels.forEach(l => list.append(l));
         const profile = new Adw.ComboRow({
@@ -92,6 +92,16 @@ export default class MechKeysPreferences extends ExtensionPreferences {
         applyProfileKey();
         const profileChanged = () => applyProfileKey();
         settings.connect('changed::profile', profileChanged);
+
+        // -- custom pack folder --------------------------------------
+        const packsDir = GLib.build_filenamev(
+            [GLib.get_user_data_dir() || GLib.get_home_dir(),
+             'mechkeys', 'packs']);
+        group.add(this._bindString(settings, 'pack-name',
+            _('Pack folder name'),
+            _('Folder with config.json + concatenated_audio.wav under ')
+            + packsDir + _(' — user-supplied, not shipped with the zip.'),
+            'r1-36ef0a69'));
 
         // -- volume --------------------------------------------------
         group.add(this._bindSpinDouble(settings, 'volume', _('Volume'),
@@ -207,6 +217,28 @@ export default class MechKeysPreferences extends ExtensionPreferences {
         group.add(row);
 
         return group;
+    }
+
+    _bindString(settings, key, title, subtitle, placeholder) {
+        const row = new Adw.EntryRow({title, subtitle});
+        let guard = false;
+        const applyFromKey = () => {
+            if (guard)
+                return;
+            guard = true;
+            row.text = settings.get_string(key);
+            guard = false;
+        };
+        row.connect('changed', () => {
+            if (guard)
+                return;
+            guard = true;
+            settings.set_string(key, row.text);
+            guard = false;
+        });
+        settings.connect(`changed::${key}`, applyFromKey);
+        applyFromKey();
+        return row;
     }
 
     _bindSpinDouble(settings, key, title, subtitle, minPct, maxPct, mult) {

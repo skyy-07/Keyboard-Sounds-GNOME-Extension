@@ -9,6 +9,27 @@ no sample downloads, no licensing worries, zero Python dependencies (~470 KB).
 *Creamy (soft & muted)*, adjust loudness, and enjoy random pitch variation so
 typing doesn't sound like a broken MP3 on loop.
 
+## Custom sound packs (MechVibes format) 🎵
+
+Any MechVibes-style pack — a folder with `config.json` + `concatenated_audio.wav`
+— can power the daemon with **per-key recordings** (a Keychron Q3 kit ships as
+`r1-36ef0a69` in the example):
+
+```bash
+mkdir -p ~/.local/share/mechkeys/packs
+cp -r /path/to/pack-folder ~/.local/share/mechkeys/packs/
+```
+
+Then choose **Custom pack** in the preferences (and type the folder name there;
+default `r1-36ef0a69`). The daemon slices the concatenated WAV into per-key
+samples on first use (cached under `~/.cache/mechkeys/packs/`), and switches
+samples instantly when you flip profiles. Keys absent from the pack fall back
+to a neighbor sample.
+
+⚠️ **Sound packs are user-supplied and never shipped** in the repo or the
+published zip — packs usually have "personal use only" licenses (this one
+does), while the synthesizer keeps the published extension fully GPL-clean.
+
 ## Features
 
 - 🎛️ **Profiles** — Thock / Clack / Creamy (all procedurally synthesized)

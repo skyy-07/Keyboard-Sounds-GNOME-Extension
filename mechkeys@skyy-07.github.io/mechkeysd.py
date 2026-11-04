@@ -42,6 +42,107 @@ KEY_MAX_PLAIN = 0x110
 # which repeats to skip when damping (avoid hammering the process spawner)
 REPEAT_MIN_INTERVAL = 0.045
 
+# evdev key codes -> JavaScript KeyboardEvent.code names (MechVibes packs use
+# these as file/config keys). Covers the standard 104-key layout.
+KEY_CODE_NAME = {
+    1: 'Escape', 2: 'Digit1', 3: 'Digit2', 4: 'Digit3', 5: 'Digit4',
+    6: 'Digit5', 7: 'Digit6', 8: 'Digit7', 9: 'Digit8', 10: 'Digit9',
+    11: 'Digit0', 12: 'Minus', 13: 'Equal', 14: 'Backspace', 15: 'Tab',
+    16: 'KeyQ', 17: 'KeyW', 18: 'KeyE', 19: 'KeyR', 20: 'KeyT', 21: 'KeyY',
+    22: 'KeyU', 23: 'KeyI', 24: 'KeyO', 25: 'KeyP', 26: 'BracketLeft',
+    27: 'BracketRight', 28: 'Enter', 29: 'ControlLeft', 30: 'KeyA',
+    31: 'KeyS', 32: 'KeyD', 33: 'KeyF', 34: 'KeyG', 35: 'KeyH', 36: 'KeyJ',
+    37: 'KeyK', 38: 'KeyL', 39: 'Semicolon', 40: 'Quote', 41: 'Backquote',
+    42: 'ShiftLeft', 43: 'Backslash', 44: 'KeyZ', 45: 'KeyX', 46: 'KeyC',
+    47: 'KeyV', 48: 'KeyB', 49: 'KeyN', 50: 'KeyM', 51: 'Comma',
+    52: 'Period', 53: 'Slash', 54: 'ShiftRight', 55: 'NumpadMultiply',
+    56: 'AltLeft', 57: 'Space', 58: 'CapsLock', 69: 'NumLock',
+    70: 'ScrollLock', 74: 'NumpadSubtract', 78: 'NumpadAdd',
+    82: 'Numpad0', 83: 'NumpadDecimal', 87: 'F11', 88: 'F12', 96: 'NumpadEnter',
+    97: 'ControlRight', 98: 'NumpadDivide', 99: 'PrintScreen', 100: 'AltRight',
+    102: 'Home', 103: 'ArrowUp', 104: 'PageUp', 105: 'ArrowLeft',
+    106: 'ArrowRight', 107: 'End', 108: 'ArrowDown', 109: 'PageDown',
+    110: 'Insert', 111: 'Delete', 113: 'AudioMute', 114: 'AudioVolumeDown',
+    115: 'AudioVolumeUp', 116: 'Power', 119: 'Pause',
+    125: 'MetaLeft', 126: 'MetaRight',
+    71: 'Numpad7', 72: 'Numpad8', 73: 'Numpad9', 75: 'Numpad4',
+    76: 'Numpad5', 77: 'Numpad6', 79: 'Numpad1', 80: 'Numpad2', 81: 'Numpad3',
+    86: 'Backslash', 152: 'NumpadComma',
+}
+# synthetic key-name for unnamed/extra keys
+KEY_FALLBACK_NAMES = ('Enter', 'Space', 'KeyA', 'KeyS', 'KeyD', 'KeyF')
+
+
+class SoundPack:
+    """MechVibes-style sound pack: config.json + one concatenated WAV.
+
+    sapi config maps key names to per-take time ranges (ms). We slice the
+    wave once into per-key WAVs in a cache dir, and later play a random
+    take for every keystroke of that key.
+    """
+
+    def __init__(self, pack_dir, cache_dir):
+        self.ok = False
+        config_path = os.path.join(pack_dir, 'config.json')
+        audio_path = os.path.join(pack_dir, 'concatenated_audio.wav')
+        try:
+            import json
+            with open(config_path, encoding='utf-8') as f:
+                cfg = json.load(f)
+        except (OSError, ValueError) as exc:
+            print(f'pack unreadable: {exc}', file=sys.stderr)
+            return
+
+        variants = {}
+        for key, info in cfg.get('definitions', {}).items():
+            for i, (start_ms, end_ms) in enumerate(info.get('timing', [])):
+                variants.setdefault(key, []).append(
+                    (int(start_ms), int(end_ms)))
+        if not variants:
+            print('pack has no key definitions', file=sys.stderr)
+            return
+
+        out_dir = os.path.join(cache_dir, cfg.get('name') or
+                               os.path.basename(pack_dir))
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            import wave
+            with wave.open(audio_path, 'rb') as src:
+                params = src.getparams()
+                raw = src.readframes(src.getnframes())
+            frame_bytes = params.sampwidth * params.nchannels
+            for key, takes in variants.items():
+                for i, (start_ms, end_ms) in enumerate(takes, start=1):
+                    f0 = int(start_ms / 1000.0 * params.framerate)
+                    nf = max(1, int((end_ms - start_ms) / 1000.0 *
+                                    params.framerate))
+                    dest = os.path.join(out_dir, f'{key}-{i}.wav')
+                    with wave.open(dest, 'wb') as dst:
+                        dst.setnchannels(params.nchannels)
+                        dst.setsampwidth(params.sampwidth)
+                        dst.setframerate(params.framerate)
+                        dst.writeframes(
+                            raw[f0 * frame_bytes:(f0 + nf) * frame_bytes])
+        except OSError as exc:
+            print(f'pack slicing failed: {exc}', file=sys.stderr)
+            return
+
+        self.files = {
+            key: [os.path.join(out_dir, f'{key}-{i}.wav')
+                  for i in range(1, len(takes) + 1)]
+            for key, takes in variants.items()
+        }
+        self.ok = True
+
+    def pick(self, code):
+        name = KEY_CODE_NAME.get(code)
+        entry = (self.files.get(name) if name else None) or \
+            (self.files.get(KEY_FALLBACK_NAMES[random.randrange(
+                len(KEY_FALLBACK_NAMES))]))
+        if not entry:
+            return None
+        return entry[random.randrange(len(entry))]
+
 
 def _ioc(direction, size, t, nr):
     return (direction << 30) | (size << 16) | (t << 8) | nr
@@ -97,8 +198,9 @@ class Args:
     """Snapshot of settings, refreshed live from GSettings (or fallbacks)."""
 
     FALLBACK = {
-        'volume': 0.6, 'profile': 'thock', 'pitch-variation': True,
-        'space-sound': True, 'repeat-damping': True, 'repeat-volume': 0.3,
+        'volume': 0.6, 'profile': 'thock', 'pack-name': 'r1-36ef0a69',
+        'pitch-variation': True, 'space-sound': True,
+        'repeat-damping': True, 'repeat-volume': 0.3,
         'release-sound': True, 'release-volume': 0.45,
     }
 
@@ -129,12 +231,14 @@ class Args:
             val = self.FALLBACK[key]
         setattr(self, arg, val)
 
-    def connect(self):
+    def connect(self, on_change=None):
         if self._s is None:
             return
         def refresh(*_a):
             for k in self.FALLBACK:
                 self._setattr(k)
+            if on_change:
+                on_change()
         self._s.connect('changed', refresh)
 
 
@@ -145,15 +249,49 @@ class Player:
         self.last_repeat = 0.0
         self.players = []
         self.devnull = subprocess.DEVNULL
+        self.pack = None
         binary = shutil.which('pw-play') or shutil.which('paplay')
         if binary is None:
             raise SystemExit('no audio player found (need pw-play or paplay)')
         self.binary = binary
+        self.reload_pack()
 
-    def _variant(self, press):
-        if self.a.pitch_variation:
-            return random.randint(1, 6)
-        return 1
+    def reload_pack(self):
+        """(Re)load a MechVibes-style pack if the profile asks for one."""
+        self.pack = None
+        if getattr(self.a, 'profile', '') != 'pack':
+            return
+        data_home = os.environ.get('XDG_DATA_HOME') or os.path.expanduser(
+            '~/.local/share')
+        pack_dir = os.path.join(data_home, 'mechkeys', 'packs',
+                                getattr(self.a, 'pack_name', ''))
+        cache = os.path.join(
+            os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'),
+            'mechkeys', 'packs')
+        self.pack = SoundPack(pack_dir, cache)
+        if not self.pack.ok:
+            print('pack not found/invalid; falling back to synthesized '
+                  '"thock" sounds', file=sys.stderr)
+            self.pack = None
+
+    def _pick_path(self, code, press):
+        if self.a.profile == 'pack':
+            if self.pack is not None and self.pack.ok:
+                return self.pack.pick(code)
+            pack = None  # fall through to synthesized sounds
+        if not press and not self.a.release_sound:
+            return None
+        kind_file = ('space' if (press and self.a.space_sound and
+                                 code == 0x39) else 'press')
+        if not press:  # releases reuse the press sample, quieter
+            kind_file = 'space' if kind_file == 'space' else 'press'
+        variant = random.randint(1, 6) if self.a.pitch_variation else 1
+        path = os.path.join(self.sounds_dir, self.a.profile
+                            if self.a.profile != 'pack' else 'thock',
+                            f'{kind_file}-{variant}.wav')
+        if not os.path.isfile(path):
+            path = os.path.join(self.sounds_dir, 'thock', 'press-1.wav')
+        return path if os.path.isfile(path) else None
 
     def play(self, code, value):
         press = value == 1
@@ -174,17 +312,9 @@ class Player:
                 return
             vol *= self.a.release_volume
 
-        kind = 'space' if self.a.space_sound and code == 0x39 else 'press'
-        if not press:  # releases reuse the press sample, quieter
-            kind_file = 'space' if kind == 'space' else 'press'
-        else:
-            kind_file = kind
-        path = os.path.join(self.sounds_dir, self.a.profile,
-                            f'{kind_file}-{self._variant(press)}.wav')
-        if not os.path.isfile(path):
-            path = os.path.join(self.sounds_dir, 'thock', 'press-1.wav')
-            if not os.path.isfile(path):
-                return
+        path = self._pick_path(code, press)
+        if path is None:
+            return
 
         argv = [self.binary, '--volume', f'{vol:.4f}', path]
         # recycle finished players
@@ -210,8 +340,8 @@ def main():
     sounds_dir = args.sounds_dir or default_dir
 
     a = Args(args)
-    a.connect()
     player = Player(sounds_dir, a)
+    a.connect(player.reload_pack)
 
     # Enumerate & open keyboards.
     sel = selectors.DefaultSelector()
