@@ -52,7 +52,7 @@ function writeAutostart(enable) {
 
 export default class MechKeysPreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
-        const settings = this.getSettings();
+        const settings = this.getSettings('org.gnome.shell.extensions.mechkeys');
 
         const page = new Adw.PreferencesPage();
         window.add(page);

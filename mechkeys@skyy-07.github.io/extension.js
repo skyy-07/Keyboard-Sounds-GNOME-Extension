@@ -51,7 +51,7 @@ class MechKeysIndicator extends PanelMenu.Button {
 
 export default class MechKeysExtension extends Extension {
     enable() {
-        this._settings = this.getSettings();
+        this._settings = this.getSettings('org.gnome.shell.extensions.mechkeys');
         this._daemon = null;
         this._indicator = new Indicator(this, this._settings);
         Main.panel.addToStatusArea('mechkeys', this._indicator);
