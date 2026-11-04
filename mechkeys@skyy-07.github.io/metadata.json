@@ -1,0 +1,18 @@
+{
+  "uuid": "mechkeys@skyy-07.github.io",
+  "name": "MechKeys",
+  "description": "Mechanical keyboard sounds for every keystroke on GNOME/Wayland. A small keyboard daemon reads key events directly from /dev/input and plays synthesized clicks (thock, clack, creamy profiles) with random pitch variation, a distinct spacebar sound and rollover damping for held keys. The panel indicator toggles it; “sudo usermod -aG input $USER” grants one-time access.",
+  "shell-version": [
+    "45",
+    "46",
+    "47",
+    "48",
+    "49",
+    "50"
+  ],
+  "url": "https://github.com/skyy-07/Keyboard-Sounds-GNOME-Extension",
+  "session-modes": [
+    "user",
+    "unlock-dialog"
+  ]
+}

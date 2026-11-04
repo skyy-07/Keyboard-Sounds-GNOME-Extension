@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.mechkeys" path="/org/gnome/shell/extensions/mechkeys/">
+    <key name="volume" type="d">
+      <range min="0.01" max="1.0"/>
+      <default>0.6</default>
+      <summary>Master volume</summary>
+      <description>Loudness of each keystroke, 0.01–1.0.</description>
+    </key>
+    <key name="profile" type="s">
+      <choices>
+        <choice value="thock"/>
+        <choice value="clack"/>
+        <choice value="creamy"/>
+      </choices>
+      <default>"thock"</default>
+      <summary>Sound profile</summary>
+      <description>Character of the synthesized clicks.</description>
+    </key>
+    <key name="pitch-variation" type="b">
+      <default>true</default>
+      <summary>Random pitch variation</summary>
+      <description>Pick one of six subtly detuned variants per press, like real keys.</description>
+    </key>
+    <key name="space-sound" type="b">
+      <default>true</default>
+      <summary>Distinct spacebar sound</summary>
+      <description>Play a deeper, longer sample for the spacebar.</description>
+    </key>
+    <key name="repeat-damping" type="b">
+      <default>true</default>
+      <summary>Rollover damping</summary>
+      <description>Play held-down (autorepeat) strokes quieter, like real typing.</description>
+    </key>
+    <key name="repeat-volume" type="d">
+      <range min="0.05" max="1.0"/>
+      <default>0.3</default>
+      <summary>Repeat volume</summary>
+      <description>Volume multiplier applied to autorepeat strokes.</description>
+    </key>
+    <key name="release-sound" type="b">
+      <default>true</default>
+      <summary>Key release sound</summary>
+      <description>Play a quieter sound when keys are released.</description>
+    </key>
+    <key name="release-volume" type="d">
+      <range min="0.0" max="1.0"/>
+      <default>0.45</default>
+      <summary>Release volume</summary>
+      <description>Volume multiplier applied to key releases.</description>
+    </key>
+    <key name="autostart" type="b">
+      <default>false</default>
+      <summary>Start automatically on login</summary>
+      <description>Run the sound daemon when the session starts.</description>
+    </key>
+  </schema>
+</schemalist>
