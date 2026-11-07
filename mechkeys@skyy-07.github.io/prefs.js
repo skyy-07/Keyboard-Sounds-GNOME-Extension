@@ -50,6 +50,125 @@ function writeAutostart(enable) {
     GLib.file_set_contents(file, contents);
 }
 
+function getInstalledPacks() {
+    const packsDir = GLib.build_filenamev(
+        [GLib.get_user_data_dir() || GLib.get_home_dir(), 'mechkeys', 'packs']);
+    GLib.mkdir_with_parents(packsDir, 0o755);
+    const packs = [];
+    try {
+        const dir = Gio.File.new_for_path(packsDir);
+        const enumerator = dir.enumerate_children(
+            'standard::name,standard::type', Gio.FileQueryInfoFlags.NONE, null);
+        let info;
+        while ((info = enumerator.next_file(null)) !== null) {
+            if (info.get_file_type() === Gio.FileType.DIRECTORY) {
+                const id = info.get_name();
+                if (id.startsWith('.'))
+                    continue;
+
+                let name = id;
+                const cfgPath = GLib.build_filenamev([packsDir, id, 'config.json']);
+                if (GLib.file_test(cfgPath, GLib.FileTest.EXISTS)) {
+                    try {
+                        const [ok, bytes] = GLib.file_get_contents(cfgPath);
+                        if (ok) {
+                            const decoder = new TextDecoder('utf-8');
+                            const cfg = JSON.parse(decoder.decode(bytes));
+                            if (cfg.name)
+                                name = `${cfg.name} (${id})`;
+                        }
+                    } catch {
+                        // ignore malformed config
+                    }
+                }
+                packs.push({id, name});
+            }
+        }
+    } catch (e) {
+        console.warn(`MechKeys enumerate packs failed: ${e}`);
+    }
+    return packs;
+}
+
+function getTestSoundPath(extDir, settings) {
+    const profile = settings.get_string('profile');
+    if (profile !== 'pack') {
+        const p = GLib.build_filenamev([extDir, 'sounds', profile, 'press-1.wav']);
+        if (GLib.file_test(p, GLib.FileTest.EXISTS))
+            return p;
+    }
+
+    const packName = settings.get_string('pack-name') || '';
+    const packsDir = GLib.build_filenamev(
+        [GLib.get_user_data_dir() || GLib.get_home_dir(), 'mechkeys', 'packs']);
+    const cacheDir = GLib.build_filenamev(
+        [GLib.get_user_cache_dir(), 'mechkeys', 'packs']);
+
+    if (packName) {
+        const packFolder = GLib.build_filenamev([packsDir, packName]);
+        const candidates = ['press-1.wav', 'press.wav', 'click-1.wav', 'space-1.wav', 'space.wav'];
+        for (const c of candidates) {
+            const p = GLib.build_filenamev([packFolder, c]);
+            if (GLib.file_test(p, GLib.FileTest.EXISTS))
+                return p;
+        }
+        try {
+            const dir = Gio.File.new_for_path(packFolder);
+            const enumerator = dir.enumerate_children(
+                'standard::name', Gio.FileQueryInfoFlags.NONE, null);
+            let info;
+            while ((info = enumerator.next_file(null)) !== null) {
+                const n = info.get_name();
+                if (n.toLowerCase().endsWith('.wav') && !n.startsWith('concatenated_audio'))
+                    return GLib.build_filenamev([packFolder, n]);
+            }
+        } catch {}
+    }
+
+    try {
+        const dir = Gio.File.new_for_path(cacheDir);
+        const enumerator = dir.enumerate_children(
+            'standard::name', Gio.FileQueryInfoFlags.NONE, null);
+        let info;
+        while ((info = enumerator.next_file(null)) !== null) {
+            const sub = GLib.build_filenamev([cacheDir, info.get_name()]);
+            for (const cand of ['KeyA-1.wav', 'Space-1.wav', 'Enter-1.wav']) {
+                const p = GLib.build_filenamev([sub, cand]);
+                if (GLib.file_test(p, GLib.FileTest.EXISTS))
+                    return p;
+            }
+        }
+    } catch {}
+
+    return GLib.build_filenamev([extDir, 'sounds', 'thock', 'press-1.wav']);
+}
+
+function importPackViaPython(sourcePath, extDir, callback) {
+    const daemonBin = GLib.find_program_in_path('python3') ?? 'python3';
+    const script = GLib.build_filenamev([extDir, 'mechkeysd.py']);
+    try {
+        const proc = new Gio.Subprocess({
+            argv: [daemonBin, script, '--import-pack', sourcePath],
+            flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+        });
+        proc.init(null);
+        proc.communicate_utf8_async(null, null, (_p, res) => {
+            try {
+                const [, stdout, stderr] = proc.communicate_utf8_finish(res);
+                if (proc.get_successful()) {
+                    callback(null, (stdout || '').trim());
+                } else {
+                    callback(new Error((stderr || '').trim() || _('Import failed')));
+                }
+            } catch (e) {
+                callback(e);
+            }
+        });
+    } catch (e) {
+        callback(e);
+    }
+}
+
 export default class MechKeysPreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
         const settings = this.getSettings('org.gnome.shell.extensions.mechkeys');
@@ -58,6 +177,7 @@ export default class MechKeysPreferences extends ExtensionPreferences {
         window.add(page);
 
         page.add(this._soundGroup(settings));
+        page.add(this._capsuleGroup(settings, window));
         page.add(this._feelGroup(settings));
         page.add(this._systemGroup(settings));
         page.add(this._setupGroup(window));
@@ -69,12 +189,12 @@ export default class MechKeysPreferences extends ExtensionPreferences {
         // -- sound profile ------------------------------------------
         const profiles = ['thock', 'clack', 'creamy', 'pack'];
         const labels = ['Thock (deep & rounded)', 'Clack (bright & snappy)',
-            'Creamy (soft & muted)', 'Custom pack (MechVibes sounds)'];
+            'Creamy (soft & muted)', 'Custom capsule (user sound pack)'];
         const list = new Gtk.StringList();
         labels.forEach(l => list.append(l));
         const profile = new Adw.ComboRow({
             title: _('Switch character'),
-            subtitle: _('The flavor of the synthesized clicks'),
+            subtitle: _('The flavor of the synthesized clicks or your custom capsule'),
             model: list,
         });
         group.add(profile);
@@ -92,16 +212,6 @@ export default class MechKeysPreferences extends ExtensionPreferences {
         applyProfileKey();
         const profileChanged = () => applyProfileKey();
         settings.connect('changed::profile', profileChanged);
-
-        // -- custom pack folder --------------------------------------
-        const packsDir = GLib.build_filenamev(
-            [GLib.get_user_data_dir() || GLib.get_home_dir(),
-             'mechkeys', 'packs']);
-        group.add(this._bindString(settings, 'pack-name',
-            _('Pack folder name'),
-            _('Folder with config.json + concatenated_audio.wav under ')
-            + packsDir + _(' — user-supplied, not shipped with the zip.'),
-            'r1-36ef0a69'));
 
         // -- volume --------------------------------------------------
         group.add(this._bindSpinDouble(settings, 'volume', _('Volume'),
@@ -121,6 +231,203 @@ export default class MechKeysPreferences extends ExtensionPreferences {
         settings.bind('pitch-variation', variation, 'active',
             Gio.SettingsBindFlags.DEFAULT);
         settings.bind('space-sound', space, 'active', Gio.SettingsBindFlags.DEFAULT);
+        return group;
+    }
+
+    _capsuleGroup(settings, window) {
+        const packsDir = GLib.build_filenamev(
+            [GLib.get_user_data_dir() || GLib.get_home_dir(), 'mechkeys', 'packs']);
+
+        const group = new Adw.PreferencesGroup({
+            title: _('Sound Capsule'),
+            description: _('Use your own keyboard recordings, MechVibes kits, or custom WAV packs'),
+        });
+
+        const packCombo = new Adw.ComboRow({
+            title: _('Active sound capsule'),
+            subtitle: _('Select an installed kit or sound folder'),
+        });
+        group.add(packCombo);
+
+        let packs = [];
+        let guard = false;
+
+        const rebuildModel = () => {
+            guard = true;
+            packs = getInstalledPacks();
+            const newList = new Gtk.StringList();
+            if (packs.length === 0) {
+                newList.append(_('(No sound capsules installed)'));
+                packCombo.set_model(newList);
+                packCombo.set_selected(0);
+            } else {
+                packs.forEach(p => newList.append(p.name));
+                packCombo.set_model(newList);
+                const curId = settings.get_string('pack-name');
+                const idx = packs.findIndex(p => p.id === curId);
+                packCombo.set_selected(idx >= 0 ? idx : 0);
+            }
+            guard = false;
+        };
+
+        packCombo.connect('notify::selected', () => {
+            if (guard)
+                return;
+            const sel = packCombo.get_selected();
+            if (packs[sel]) {
+                guard = true;
+                settings.set_string('pack-name', packs[sel].id);
+                settings.set_string('profile', 'pack');
+                guard = false;
+            }
+        });
+
+        settings.connect('changed::pack-name', () => {
+            if (guard)
+                return;
+            guard = true;
+            const curId = settings.get_string('pack-name');
+            const idx = packs.findIndex(p => p.id === curId);
+            if (idx >= 0)
+                packCombo.set_selected(idx);
+            guard = false;
+        });
+
+        rebuildModel();
+
+        // -- Open Folder ActionRow ------------------------------------
+        const openFolderRow = new Adw.ActionRow({
+            title: _('Capsules folder'),
+            subtitle: packsDir + _(' — drop sound folders here'),
+        });
+        const refreshBtn = new Gtk.Button({
+            icon_name: 'view-refresh-symbolic',
+            tooltip_text: _('Refresh capsules list'),
+            valign: Gtk.Align.CENTER,
+            css_classes: ['flat'],
+        });
+        refreshBtn.connect('clicked', () => {
+            rebuildModel();
+            if (window?.add_toast)
+                window.add_toast(new Adw.Toast({title: _('Capsules refreshed')}));
+        });
+        const openBtn = new Gtk.Button({
+            label: _('Open Folder'),
+            valign: Gtk.Align.CENTER,
+            css_classes: ['flat'],
+        });
+        openBtn.connect('clicked', () => {
+            GLib.mkdir_with_parents(packsDir, 0o755);
+            try {
+                Gio.AppInfo.launch_default_for_uri(
+                    GLib.filename_to_uri(packsDir, null), null);
+            } catch (e) {
+                console.warn(`Could not open folder: ${e}`);
+            }
+        });
+        openFolderRow.add_suffix(refreshBtn);
+        openFolderRow.add_suffix(openBtn);
+        group.add(openFolderRow);
+
+        // -- Import ActionRow -----------------------------------------
+        const importRow = new Adw.ActionRow({
+            title: _('Import sound capsule'),
+            subtitle: _('Extract a .zip archive or copy a sound folder'),
+        });
+
+        const importZipBtn = new Gtk.Button({
+            label: _('Import .zip…'),
+            valign: Gtk.Align.CENTER,
+            css_classes: ['flat'],
+        });
+        importZipBtn.connect('clicked', () => {
+            const filter = new Gtk.FileFilter();
+            filter.set_name(_('Zip Archives (*.zip)'));
+            filter.add_pattern('*.zip');
+
+            const dialog = new Gtk.FileDialog({
+                title: _('Choose Sound Capsule Archive (.zip)'),
+            });
+            dialog.set_default_filter(filter);
+            dialog.open(window, null, (source, result) => {
+                try {
+                    const file = source.open_finish(result);
+                    const path = file.get_path();
+                    if (path) {
+                        importPackViaPython(path, EXT_DIR, (err, name) => {
+                            if (!err && name) {
+                                settings.set_string('pack-name', name);
+                                settings.set_string('profile', 'pack');
+                                rebuildModel();
+                                if (window?.add_toast) {
+                                    window.add_toast(new Adw.Toast({
+                                        title: _(`Imported capsule: ${name}`),
+                                    }));
+                                }
+                            } else if (err) {
+                                if (window?.add_toast) {
+                                    window.add_toast(new Adw.Toast({
+                                        title: _(`Import failed: ${err.message}`),
+                                    }));
+                                }
+                            }
+                        });
+                    }
+                } catch {
+                    // user cancelled
+                }
+            });
+        });
+
+        const importFolderBtn = new Gtk.Button({
+            label: _('Import folder…'),
+            valign: Gtk.Align.CENTER,
+            css_classes: ['flat'],
+        });
+        importFolderBtn.connect('clicked', () => {
+            const dialog = new Gtk.FileDialog({
+                title: _('Choose Sound Capsule Folder'),
+            });
+            dialog.select_folder(window, null, (source, result) => {
+                try {
+                    const folder = source.select_folder_finish(result);
+                    const path = folder.get_path();
+                    if (path) {
+                        importPackViaPython(path, EXT_DIR, (err, name) => {
+                            if (!err && name) {
+                                settings.set_string('pack-name', name);
+                                settings.set_string('profile', 'pack');
+                                rebuildModel();
+                                if (window?.add_toast) {
+                                    window.add_toast(new Adw.Toast({
+                                        title: _(`Imported capsule: ${name}`),
+                                    }));
+                                }
+                            } else if (err) {
+                                if (window?.add_toast) {
+                                    window.add_toast(new Adw.Toast({
+                                        title: _(`Import failed: ${err.message}`),
+                                    }));
+                                }
+                            }
+                        });
+                    }
+                } catch {
+                    // user cancelled
+                }
+            });
+        });
+
+        importRow.add_suffix(importZipBtn);
+        importRow.add_suffix(importFolderBtn);
+        group.add(importRow);
+
+        // -- Manual folder name EntryRow ------------------------------
+        group.add(this._bindString(settings, 'pack-name',
+            _('Capsule folder name'),
+            _('Folder name inside ~/.local/share/mechkeys/packs/'),
+            'r1-36ef0a69'));
+
         return group;
     }
 
@@ -164,31 +471,7 @@ export default class MechKeysPreferences extends ExtensionPreferences {
                 GLib.find_program_in_path('paplay');
             if (!pw)
                 return;
-            let path = GLib.build_filenamev([EXT_DIR, 'sounds',
-                settings.get_string('profile'), 'press-1.wav']);
-            if (!GLib.file_test(path, GLib.FileTest.EXISTS)) {
-                const packCacheDir = GLib.build_filenamev(
-                    [GLib.get_user_cache_dir(), 'mechkeys', 'packs']);
-                let found = null;
-                try {
-                    const dir = Gio.File.new_for_path(packCacheDir);
-                    const enumerator = dir.enumerate_children(
-                        'standard::name', Gio.FileQueryInfoFlags.NONE, null);
-                    let info;
-                    while ((info = enumerator.next_file(null)) !== null) {
-                        const testKey = GLib.build_filenamev(
-                            [packCacheDir, info.get_name(), 'KeyA-1.wav']);
-                        if (GLib.file_test(testKey, GLib.FileTest.EXISTS)) {
-                            found = testKey;
-                            break;
-                        }
-                    }
-                } catch {
-                    // cache not ready
-                }
-                path = found ?? GLib.build_filenamev(
-                    [EXT_DIR, 'sounds', 'thock', 'press-1.wav']);
-            }
+            const path = getTestSoundPath(EXT_DIR, settings);
             const proc = new Gio.Subprocess({
                 argv: [pw, '--volume', settings.get_double('volume').toFixed(2), path],
                 flags: Gio.SubprocessFlags.NONE,

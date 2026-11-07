@@ -17,6 +17,7 @@ Exit codes:
 
 import argparse
 import fcntl
+import json
 import os
 import random
 import selectors
@@ -26,6 +27,7 @@ import struct
 import subprocess
 import sys
 import time
+import zipfile
 
 EV_KEY = 1
 EV_REL = 2
@@ -73,37 +75,97 @@ KEY_CODE_NAME = {
 KEY_FALLBACK_NAMES = ('Enter', 'Space', 'KeyA', 'KeyS', 'KeyD', 'KeyF')
 
 
-class SoundPack:
-    """MechVibes-style sound pack: config.json + one concatenated WAV.
+AUDIO_EXTENSIONS = ('.wav', '.ogg', '.flac', '.mp3')
 
-    sapi config maps key names to per-take time ranges (ms). We slice the
-    wave once into per-key WAVs in a cache dir, and later play a random
-    take for every keystroke of that key.
+
+class SoundPack:
+    """Supports both MechVibes-style packs and loose-audio custom sound capsules.
+
+    1. MechVibes packs: config.json + concatenated audio (or discrete files).
+       Slices audio into per-key WAVs under ~/.cache/mechkeys/packs/<name>/ once.
+    2. Custom audio capsules: A folder containing audio files (e.g. press.wav,
+       space.wav, click-1.wav, etc.). Maps named keys or picks randomly from
+       available sounds.
     """
 
     def __init__(self, pack_dir, cache_dir):
         self.ok = False
+        self.files = {}          # key_name -> list of file paths
+        self.generic_press = []  # fallback press files
+        self.generic_release = []# fallback release files
+        self.pack_name = os.path.basename(pack_dir.rstrip(os.sep))
+
+        if not os.path.isdir(pack_dir):
+            return
+
         config_path = os.path.join(pack_dir, 'config.json')
-        audio_path = os.path.join(pack_dir, 'concatenated_audio.wav')
+        if os.path.isfile(config_path):
+            if self._load_mechvibes(pack_dir, config_path, cache_dir):
+                self.ok = True
+                return
+
+        # If no config.json or MechVibes load failed, try loading as a loose sound capsule
+        if self._load_audio_capsule(pack_dir):
+            self.ok = True
+
+    def _load_mechvibes(self, pack_dir, config_path, cache_dir):
         try:
-            import json
             with open(config_path, encoding='utf-8') as f:
                 cfg = json.load(f)
-        except (OSError, ValueError) as exc:
-            print(f'pack unreadable: {exc}', file=sys.stderr)
-            return
+        except Exception as exc:
+            print(f'pack config unreadable: {exc}', file=sys.stderr)
+            return False
 
+        pack_name = cfg.get('name') or self.pack_name
+        self.pack_name = pack_name
+
+        audio_name = cfg.get('sound') or 'concatenated_audio.wav'
+        audio_path = os.path.join(pack_dir, audio_name)
+        if not os.path.isfile(audio_path):
+            for f in sorted(os.listdir(pack_dir)):
+                if f.lower().endswith(AUDIO_EXTENSIONS):
+                    audio_path = os.path.join(pack_dir, f)
+                    break
+
+        definitions = cfg.get('definitions', {}) or cfg.get('key_defines', {})
+        if not definitions:
+            return False
+
+        has_timing = False
         variants = {}
-        for key, info in cfg.get('definitions', {}).items():
-            for i, (start_ms, end_ms) in enumerate(info.get('timing', [])):
-                variants.setdefault(key, []).append(
-                    (int(start_ms), int(end_ms)))
-        if not variants:
-            print('pack has no key definitions', file=sys.stderr)
-            return
+        discrete_files = {}
 
-        out_dir = os.path.join(cache_dir, cfg.get('name') or
-                               os.path.basename(pack_dir))
+        for key, info in definitions.items():
+            if isinstance(info, dict) and 'timing' in info:
+                has_timing = True
+                for start_ms, end_ms in info.get('timing', []):
+                    variants.setdefault(key, []).append((int(start_ms), int(end_ms)))
+            elif isinstance(info, str) and info.lower().endswith(AUDIO_EXTENSIONS):
+                target_file = os.path.join(pack_dir, info)
+                if os.path.isfile(target_file):
+                    discrete_files.setdefault(key, []).append(target_file)
+
+        if discrete_files and not has_timing:
+            self.files = discrete_files
+            self._fill_generic_from_files()
+            return bool(self.files)
+
+        if not has_timing or not os.path.isfile(audio_path):
+            return False
+
+        out_dir = os.path.join(cache_dir, pack_name)
+        self.files = {
+            key: [os.path.join(out_dir, f'{key}-{i}.wav')
+                  for i in range(1, len(takes) + 1)]
+            for key, takes in variants.items()
+        }
+
+        # Check if cache is already complete
+        all_exist = all(os.path.isfile(p) for flist in self.files.values() for p in flist)
+        if all_exist:
+            self._fill_generic_from_files()
+            return True
+
         try:
             os.makedirs(out_dir, exist_ok=True)
             import wave
@@ -114,34 +176,177 @@ class SoundPack:
             for key, takes in variants.items():
                 for i, (start_ms, end_ms) in enumerate(takes, start=1):
                     f0 = int(start_ms / 1000.0 * params.framerate)
-                    nf = max(1, int((end_ms - start_ms) / 1000.0 *
-                                    params.framerate))
+                    nf = max(1, int((end_ms - start_ms) / 1000.0 * params.framerate))
                     dest = os.path.join(out_dir, f'{key}-{i}.wav')
                     with wave.open(dest, 'wb') as dst:
                         dst.setnchannels(params.nchannels)
                         dst.setsampwidth(params.sampwidth)
                         dst.setframerate(params.framerate)
-                        dst.writeframes(
-                            raw[f0 * frame_bytes:(f0 + nf) * frame_bytes])
+                        dst.writeframes(raw[f0 * frame_bytes:(f0 + nf) * frame_bytes])
         except OSError as exc:
             print(f'pack slicing failed: {exc}', file=sys.stderr)
-            return
+            return False
 
-        self.files = {
-            key: [os.path.join(out_dir, f'{key}-{i}.wav')
-                  for i in range(1, len(takes) + 1)]
-            for key, takes in variants.items()
-        }
-        self.ok = True
+        self._fill_generic_from_files()
+        return True
 
-    def pick(self, code):
+    def _load_audio_capsule(self, pack_dir):
+        """Load loose audio files from a sound capsule folder."""
+        found_files = []
+        for root, _, files in os.walk(pack_dir):
+            for f in sorted(files):
+                if f.lower().endswith(AUDIO_EXTENSIONS) and not f.startswith('.'):
+                    found_files.append(os.path.join(root, f))
+
+        if not found_files:
+            return False
+
+        for path in found_files:
+            base = os.path.splitext(os.path.basename(path))[0].lower()
+
+            if any(k in base for k in ('release', 'up')):
+                self.generic_release.append(path)
+                continue
+
+            matched = False
+            if 'space' in base:
+                self.files.setdefault('Space', []).append(path)
+                matched = True
+            elif 'enter' in base or 'return' in base:
+                self.files.setdefault('Enter', []).append(path)
+                matched = True
+            elif 'backspace' in base:
+                self.files.setdefault('Backspace', []).append(path)
+                matched = True
+            elif 'tab' in base:
+                self.files.setdefault('Tab', []).append(path)
+                matched = True
+            elif 'delete' in base:
+                self.files.setdefault('Delete', []).append(path)
+                matched = True
+            elif 'esc' in base:
+                self.files.setdefault('Escape', []).append(path)
+                matched = True
+            else:
+                for code_name in KEY_CODE_NAME.values():
+                    c_low = code_name.lower()
+                    if base == c_low or base.startswith(c_low + '-') or base.startswith(c_low + '_'):
+                        self.files.setdefault(code_name, []).append(path)
+                        matched = True
+                        break
+
+            if not matched or any(k in base for k in ('press', 'click', 'hit', 'down', 'stroke', 'tap', 'key')):
+                self.generic_press.append(path)
+
+        if not self.generic_press and found_files:
+            self.generic_press = [f for f in found_files if f not in self.generic_release] or found_files
+
+        self._fill_generic_from_files()
+        return True
+
+    def _fill_generic_from_files(self):
+        if not self.generic_press:
+            for k in KEY_FALLBACK_NAMES:
+                if k in self.files:
+                    self.generic_press.extend(self.files[k])
+            if not self.generic_press:
+                for flist in self.files.values():
+                    self.generic_press.extend(flist)
+
+    def pick(self, code, is_release=False):
+        if is_release and self.generic_release:
+            return random.choice(self.generic_release)
+
         name = KEY_CODE_NAME.get(code)
-        entry = (self.files.get(name) if name else None) or \
-            (self.files.get(KEY_FALLBACK_NAMES[random.randrange(
-                len(KEY_FALLBACK_NAMES))]))
-        if not entry:
+        if name and name in self.files and self.files[name]:
+            return random.choice(self.files[name])
+
+        if self.generic_press:
+            return random.choice(self.generic_press)
+
+        return None
+
+
+def import_pack(source_path):
+    """Import a .zip archive or directory into ~/.local/share/mechkeys/packs/."""
+    source_path = os.path.expanduser(source_path)
+    if not os.path.exists(source_path):
+        print(f"Error: {source_path} does not exist", file=sys.stderr)
+        return None
+
+    data_home = os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
+    dest_base = os.path.join(data_home, 'mechkeys', 'packs')
+    os.makedirs(dest_base, exist_ok=True)
+
+    base_name = os.path.splitext(os.path.basename(source_path.rstrip(os.sep)))[0]
+    safe_name = "".join(c if (c.isalnum() or c in '._- ') else '_' for c in base_name).strip() or "custom_pack"
+    target_dir = os.path.join(dest_base, safe_name)
+
+    if os.path.isfile(source_path):
+        if not zipfile.is_zipfile(source_path):
+            if source_path.lower().endswith(AUDIO_EXTENSIONS):
+                os.makedirs(target_dir, exist_ok=True)
+                shutil.copy2(source_path, target_dir)
+                return safe_name
+            print(f"Error: {source_path} is not a valid zip archive or audio file", file=sys.stderr)
             return None
-        return entry[random.randrange(len(entry))]
+
+        with zipfile.ZipFile(source_path, 'r') as z:
+            top_levels = {p.split('/')[0] for p in z.namelist() if p and not p.startswith('/')}
+            has_root_files = any('/' not in p and p for p in z.namelist() if not p.endswith('/'))
+            if len(top_levels) == 1 and not has_root_files:
+                inner_dir = list(top_levels)[0]
+                temp_extract = os.path.join(dest_base, f".tmp_{safe_name}")
+                if os.path.exists(temp_extract):
+                    shutil.rmtree(temp_extract)
+                z.extractall(temp_extract)
+                extracted_root = os.path.join(temp_extract, inner_dir)
+                if os.path.exists(target_dir):
+                    shutil.rmtree(target_dir)
+                shutil.move(extracted_root, target_dir)
+                shutil.rmtree(temp_extract, ignore_errors=True)
+            else:
+                if os.path.exists(target_dir):
+                    shutil.rmtree(target_dir)
+                os.makedirs(target_dir, exist_ok=True)
+                z.extractall(target_dir)
+        return safe_name
+
+    elif os.path.isdir(source_path):
+        if os.path.abspath(source_path) == os.path.abspath(target_dir):
+            return safe_name
+        if os.path.exists(target_dir):
+            shutil.rmtree(target_dir)
+        shutil.copytree(source_path, target_dir)
+        return safe_name
+
+    return None
+
+
+def list_packs():
+    """List all sound packs / capsules installed under ~/.local/share/mechkeys/packs/."""
+    data_home = os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
+    packs_dir = os.path.join(data_home, 'mechkeys', 'packs')
+    results = []
+    if os.path.isdir(packs_dir):
+        for entry in sorted(os.listdir(packs_dir)):
+            if entry.startswith('.'):
+                continue
+            full_path = os.path.join(packs_dir, entry)
+            if not os.path.isdir(full_path):
+                continue
+            info = {"id": entry, "path": full_path, "name": entry, "type": "audio_capsule"}
+            cfg_path = os.path.join(full_path, "config.json")
+            if os.path.isfile(cfg_path):
+                try:
+                    with open(cfg_path, "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    info["name"] = cfg.get("name") or entry
+                    info["type"] = "mechvibes"
+                except Exception:
+                    pass
+            results.append(info)
+    return results
 
 
 def _ioc(direction, size, t, nr):
@@ -266,28 +471,52 @@ class Player:
         self.reload_pack()
 
     def reload_pack(self):
-        """(Re)load a MechVibes-style pack if the profile asks for one."""
+        """(Re)load a custom sound capsule / MechVibes pack."""
         self.pack = None
         if getattr(self.a, 'profile', '') != 'pack':
             return
         data_home = os.environ.get('XDG_DATA_HOME') or os.path.expanduser(
             '~/.local/share')
-        pack_dir = os.path.join(data_home, 'mechkeys', 'packs',
-                                getattr(self.a, 'pack_name', ''))
+        pack_name = getattr(self.a, 'pack_name', '').strip()
+        packs_base = os.path.join(data_home, 'mechkeys', 'packs')
+
+        pack_dir = ''
+        if pack_name and os.path.isabs(pack_name) and os.path.isdir(pack_name):
+            pack_dir = pack_name
+        elif pack_name:
+            pack_dir = os.path.join(packs_base, pack_name)
+
+        # Fallback to any installed pack if specified pack doesn't exist
+        if (not pack_dir or not os.path.isdir(pack_dir)) and os.path.isdir(packs_base):
+            for e in sorted(os.listdir(packs_base)):
+                p = os.path.join(packs_base, e)
+                if not e.startswith('.') and os.path.isdir(p):
+                    pack_dir = p
+                    break
+
         cache = os.path.join(
             os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'),
             'mechkeys', 'packs')
-        self.pack = SoundPack(pack_dir, cache)
-        if not self.pack.ok:
-            print('pack not found/invalid; falling back to synthesized '
-                  '"thock" sounds', file=sys.stderr)
-            self.pack = None
+        if pack_dir and os.path.isdir(pack_dir):
+            self.pack = SoundPack(pack_dir, cache)
+            if self.pack.ok:
+                return
+
+        print('Sound capsule not found/invalid; falling back to synthesized "thock" sounds',
+              file=sys.stderr)
+        self.pack = None
 
     def _pick_path(self, code, press):
         if self.a.profile == 'pack':
             if self.pack is not None and self.pack.ok:
-                return self.pack.pick(code)
-            pack = None  # fall through to synthesized sounds
+                sample = self.pack.pick(code, is_release=not press)
+                if sample is not None:
+                    return sample
+                if not press and self.a.release_sound:
+                    return self.pack.pick(code, is_release=False)
+                if press:
+                    return self.pack.pick(code, is_release=False)
+            # If pack failed or missing, fall through to synthesized sounds
         if not press and not self.a.release_sound:
             return None
         kind_file = ('space' if (press and self.a.space_sound and
@@ -345,8 +574,22 @@ def main():
     ap.add_argument('--sounds-dir', default=None)
     ap.add_argument('--schemadir', default=None)
     ap.add_argument('--schema', default='org.gnome.shell.extensions.mechkeys')
+    ap.add_argument('--import-pack', metavar='PATH', help='Import a .zip or folder into sound capsules and exit')
+    ap.add_argument('--list-packs', action='store_true', help='List installed sound capsules in JSON format and exit')
     ap.add_argument('--debug', action='store_true')
     args = ap.parse_args()
+
+    if args.list_packs:
+        print(json.dumps(list_packs()))
+        sys.exit(0)
+
+    if args.import_pack:
+        imported_name = import_pack(args.import_pack)
+        if imported_name:
+            print(imported_name)
+            sys.exit(0)
+        else:
+            sys.exit(1)
 
     default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sounds')
     sounds_dir = args.sounds_dir or default_dir

@@ -9,26 +9,31 @@ no sample downloads, no licensing worries, zero Python dependencies (~470 KB).
 *Creamy (soft & muted)*, adjust loudness, and enjoy random pitch variation so
 typing doesn't sound like a broken MP3 on loop.
 
-## Custom sound packs (MechVibes format) 🎵
+## Custom sound capsules & sound packs 🎵
 
-Any MechVibes-style pack — a folder with `config.json` + `concatenated_audio.wav`
-— can power the daemon with **per-key recordings** (a Keychron Q3 kit ships as
-`r1-36ef0a69` in the example):
+You can load your own custom sound capsules and keyboard recordings into MechKeys:
 
+### 1. Through Preferences GUI (Easiest)
+Open the extension settings (click panel icon → **Settings…** or `gnome-extensions prefs mechkeys@skyy-07.github.io`):
+- Click **Import .zip…** to extract and install any downloaded sound pack archive directly.
+- Click **Import folder…** to copy a sound folder from anywhere on your machine.
+- Click **Open Folder** to reveal `~/.local/share/mechkeys/packs` in Nautilus and drop sound folders directly.
+- Use the **Active sound capsule** dropdown to instantly switch between your installed capsules.
+
+### 2. Supported Formats
+- **Custom Audio Folders**: Any folder of `.wav`, `.ogg`, `.flac`, or `.mp3` files (e.g. `press-1.wav`, `space.wav`, `click.wav`, or per-key recordings). Keys absent from specific mappings automatically use generic press clicks.
+- **MechVibes packs**: Folders with `config.json` + `concatenated_audio.wav` (or discrete key sounds). Sliced automatically and cached under `~/.cache/mechkeys/packs/`.
+
+### 3. Command Line (Optional)
 ```bash
-mkdir -p ~/.local/share/mechkeys/packs
-cp -r /path/to/pack-folder ~/.local/share/mechkeys/packs/
+# Import an archive or folder:
+python3 ~/.local/share/gnome-shell/extensions/mechkeys@skyy-07.github.io/mechkeysd.py --import-pack /path/to/capsule.zip
+
+# List installed capsules:
+python3 ~/.local/share/gnome-shell/extensions/mechkeys@skyy-07.github.io/mechkeysd.py --list-packs
 ```
 
-Then choose **Custom pack** in the preferences (and type the folder name there;
-default `r1-36ef0a69`). The daemon slices the concatenated WAV into per-key
-samples on first use (cached under `~/.cache/mechkeys/packs/`), and switches
-samples instantly when you flip profiles. Keys absent from the pack fall back
-to a neighbor sample.
-
-⚠️ **Sound packs are user-supplied and never shipped** in the repo or the
-published zip — packs usually have "personal use only" licenses (this one
-does), while the synthesizer keeps the published extension fully GPL-clean.
+⚠️ **Sound packs are user-supplied and never shipped** in the repo or published zip — packs usually have "personal use only" licenses, while the built-in synthesizer keeps the published extension fully GPL-clean.
 
 ## Features
 

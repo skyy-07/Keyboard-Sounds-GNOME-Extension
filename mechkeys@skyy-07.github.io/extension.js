@@ -12,6 +12,59 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 // exit code emitted by mechkeysd.py when /dev/input is unreadable
 const PERM_EXIT_CODE = 12;
 
+function getTestSoundPath(extDir, settings) {
+    const profile = settings.get_string('profile');
+    if (profile !== 'pack') {
+        const p = GLib.build_filenamev([extDir, 'sounds', profile, 'press-1.wav']);
+        if (GLib.file_test(p, GLib.FileTest.EXISTS))
+            return p;
+    }
+
+    const packName = settings.get_string('pack-name') || '';
+    const packsDir = GLib.build_filenamev(
+        [GLib.get_user_data_dir() || GLib.get_home_dir(), 'mechkeys', 'packs']);
+    const cacheDir = GLib.build_filenamev(
+        [GLib.get_user_cache_dir(), 'mechkeys', 'packs']);
+
+    if (packName) {
+        const packFolder = GLib.build_filenamev([packsDir, packName]);
+        const candidates = ['press-1.wav', 'press.wav', 'click-1.wav', 'space-1.wav', 'space.wav'];
+        for (const c of candidates) {
+            const p = GLib.build_filenamev([packFolder, c]);
+            if (GLib.file_test(p, GLib.FileTest.EXISTS))
+                return p;
+        }
+        try {
+            const dir = Gio.File.new_for_path(packFolder);
+            const enumerator = dir.enumerate_children(
+                'standard::name', Gio.FileQueryInfoFlags.NONE, null);
+            let info;
+            while ((info = enumerator.next_file(null)) !== null) {
+                const n = info.get_name();
+                if (n.toLowerCase().endsWith('.wav') && !n.startsWith('concatenated_audio'))
+                    return GLib.build_filenamev([packFolder, n]);
+            }
+        } catch {}
+    }
+
+    try {
+        const dir = Gio.File.new_for_path(cacheDir);
+        const enumerator = dir.enumerate_children(
+            'standard::name', Gio.FileQueryInfoFlags.NONE, null);
+        let info;
+        while ((info = enumerator.next_file(null)) !== null) {
+            const sub = GLib.build_filenamev([cacheDir, info.get_name()]);
+            for (const cand of ['KeyA-1.wav', 'Space-1.wav', 'Enter-1.wav']) {
+                const p = GLib.build_filenamev([sub, cand]);
+                if (GLib.file_test(p, GLib.FileTest.EXISTS))
+                    return p;
+            }
+        }
+    } catch {}
+
+    return GLib.build_filenamev([extDir, 'sounds', 'thock', 'press-1.wav']);
+}
+
 const Indicator = GObject.registerClass(
 class MechKeysIndicator extends PanelMenu.Button {
     _init(ext, settings) {
@@ -109,32 +162,7 @@ export default class MechKeysExtension extends Extension {
     playTest() {
         try {
             const volume = this._settings.get_double('volume');
-            const profile = this._settings.get_string('profile');
-            let path = GLib.build_filenamev(
-                [this.path, 'sounds', profile, 'press-1.wav']);
-            if (!GLib.file_test(path, GLib.FileTest.EXISTS)) {
-                const packCacheDir = GLib.build_filenamev(
-                    [GLib.get_user_cache_dir(), 'mechkeys', 'packs']);
-                let found = null;
-                try {
-                    const dir = Gio.File.new_for_path(packCacheDir);
-                    const enumerator = dir.enumerate_children(
-                        'standard::name', Gio.FileQueryInfoFlags.NONE, null);
-                    let info;
-                    while ((info = enumerator.next_file(null)) !== null) {
-                        const testKey = GLib.build_filenamev(
-                            [packCacheDir, info.get_name(), 'KeyA-1.wav']);
-                        if (GLib.file_test(testKey, GLib.FileTest.EXISTS)) {
-                            found = testKey;
-                            break;
-                        }
-                    }
-                } catch {
-                    // cache not ready
-                }
-                path = found ?? GLib.build_filenamev(
-                    [this.path, 'sounds', 'thock', 'press-1.wav']);
-            }
+            const path = getTestSoundPath(this.path, this._settings);
             const pw = GLib.find_program_in_path('pw-play') ??
                 GLib.find_program_in_path('paplay');
             if (!pw)
