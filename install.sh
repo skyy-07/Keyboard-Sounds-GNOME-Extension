@@ -7,12 +7,12 @@ EXT_DIR="mechkeys@skyy-07.github.io"
 EXT_ID="mechkeys@skyy-07.github.io"
 DEST="$HOME/.local/share/gnome-shell/extensions/$EXT_ID"
 
-glib-compile-schemas "$EXT_DIR/schemas/"
-
 mkdir -p "$HOME/.local/share/gnome-shell/extensions"
 rm -rf "$DEST"
 cp -r "$EXT_DIR" "$DEST"
 find "$DEST" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+
+glib-compile-schemas "$DEST/schemas/"
 
 echo
 echo "Installed to: $DEST"

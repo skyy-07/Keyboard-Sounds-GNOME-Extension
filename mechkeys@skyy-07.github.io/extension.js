@@ -80,7 +80,7 @@ class MechKeysIndicator extends PanelMenu.Button {
         this.add_child(this._icon);
 
         this._switch = new PopupMenu.PopupSwitchMenuItem(_('Keyboard sounds'), true);
-        this._switch.connect('toggled', (_o, state) => {
+        this._switchId = this._switch.connect('toggled', (_o, state) => {
             state ? ext.startDaemon() : ext.stopDaemon();
         });
         this.menu.addMenuItem(this._switch);
@@ -97,8 +97,23 @@ class MechKeysIndicator extends PanelMenu.Button {
     }
 
     setRunning(running) {
-        this._switch.setToggleState(running);
-        this._icon.opacity = running ? 255 : 130;
+        this._switch?.setToggleState(running);
+        if (this._icon)
+            this._icon.opacity = running ? 255 : 130;
+    }
+
+    destroy() {
+        if (this._switchId && this._switch) {
+            this._switch.disconnect(this._switchId);
+            this._switchId = null;
+        }
+        this._switch?.destroy();
+        this._switch = null;
+        this._icon?.destroy();
+        this._icon = null;
+        this._ext = null;
+        this._settings = null;
+        super.destroy();
     }
 });
 
@@ -106,6 +121,7 @@ export default class MechKeysExtension extends Extension {
     enable() {
         this._settings = this.getSettings('org.gnome.shell.extensions.mechkeys');
         this._daemon = null;
+        this._daemonWaitId = null;
         this._indicator = new Indicator(this, this._settings);
         Main.panel.addToStatusArea('mechkeys', this._indicator);
         this.startDaemon();
@@ -135,8 +151,9 @@ export default class MechKeysExtension extends Extension {
                 flags: Gio.SubprocessFlags.NONE,
             });
             this._daemon.init(null);
-            this._daemon.connect('wait', (_sub, _result) => {
-                const status = this._daemon.get_exit_status();
+            this._daemonWaitId = this._daemon.connect('wait', (_sub, _result) => {
+                this._daemonWaitId = null;
+                const status = this._daemon ? this._daemon.get_exit_status() : 0;
                 if (status === PERM_EXIT_CODE) {
                     Main.notify(_('MechKeys needs keyboard access'),
                         _('Run “sudo usermod -aG input $USER” in a terminal, then log out and back in.'));
@@ -146,6 +163,7 @@ export default class MechKeysExtension extends Extension {
             this._indicator?.setRunning(true);
         } catch (exc) {
             this._daemon = null;
+            this._daemonWaitId = null;
             Main.notify(_('MechKeys could not start'), String(exc));
         }
     }
@@ -153,8 +171,14 @@ export default class MechKeysExtension extends Extension {
     stopDaemon() {
         const daemon = this._daemon;
         this._daemon = null;
-        if (daemon && !daemon.get_if_exited()) {
-            daemon.send_signal(GLib.ProcessSignal.TERM);
+        if (daemon) {
+            if (this._daemonWaitId) {
+                daemon.disconnect(this._daemonWaitId);
+                this._daemonWaitId = null;
+            }
+            if (!daemon.get_if_exited()) {
+                daemon.send_signal(GLib.ProcessSignal.TERM);
+            }
         }
         this._indicator?.setRunning(false);
     }
