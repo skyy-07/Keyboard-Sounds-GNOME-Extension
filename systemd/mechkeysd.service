@@ -1,0 +1,13 @@
+[Unit]
+Description=MechKeys mechanical keyboard sounds daemon
+Documentation=https://github.com/skyy-07/Keyboard-Sounds-GNOME-Extension
+After=sound.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env mechkeysd
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=default.target

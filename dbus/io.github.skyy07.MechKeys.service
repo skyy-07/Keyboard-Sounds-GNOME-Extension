@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=io.github.skyy07.MechKeys
+Exec=/usr/bin/env mechkeysd
+SystemdService=mechkeysd.service

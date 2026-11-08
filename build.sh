@@ -10,10 +10,7 @@ OUT="$(pwd)/dist/mechkeys@skyy-07.github.io.zip"
 mkdir -p dist
 rm -f "$OUT"
 
-# Ensure proper permissions (non-exec for scripts/data)
-chmod 644 "$EXT_DIR"/mechkeysd.py 2>/dev/null || true
-
 ( cd "$EXT_DIR" && zip -r -X "$OUT" . \
-    -x '*.pyc' -x '__pycache__/*' -x '.git*' -x 'schemas/gschemas.compiled' )
+    -x '*.pyc' -x '*.py' -x '__pycache__/*' -x '.git*' -x 'schemas/gschemas.compiled' )
 
 echo "built: $OUT"

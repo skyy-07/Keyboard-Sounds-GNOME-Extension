@@ -9,10 +9,45 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
-// exit code emitted by mechkeysd.py when /dev/input is unreadable
-const PERM_EXIT_CODE = 12;
+const DBUS_NAME = 'io.github.skyy07.MechKeys';
+const DBUS_PATH = '/io/github/skyy07/MechKeys';
+
+const MechKeysInterface = `
+<node>
+  <interface name="io.github.skyy07.MechKeys">
+    <method name="GetStatus">
+      <arg type="b" name="running" direction="out"/>
+      <arg type="s" name="profile" direction="out"/>
+      <arg type="d" name="volume" direction="out"/>
+    </method>
+    <method name="SetRunning">
+      <arg type="b" name="running" direction="in"/>
+    </method>
+    <method name="PlayTest">
+    </method>
+    <method name="Reload">
+    </method>
+    <method name="ImportPack">
+      <arg type="s" name="path" direction="in"/>
+      <arg type="s" name="name" direction="out"/>
+    </method>
+    <method name="ListPacks">
+      <arg type="s" name="json_packs" direction="out"/>
+    </method>
+    <method name="Quit">
+    </method>
+    <signal name="StatusChanged">
+      <arg type="b" name="running"/>
+    </signal>
+  </interface>
+</node>`;
+
+const MechKeysProxy = Gio.DBusProxy.makeProxyWrapper(MechKeysInterface);
 
 function getTestSoundPath(extDir, settings) {
+    if (!settings)
+        return GLib.build_filenamev([extDir, 'sounds', 'thock', 'press-1.wav']);
+
     const profile = settings.get_string('profile');
     if (profile !== 'pack') {
         const p = GLib.build_filenamev([extDir, 'sounds', profile, 'press-1.wav']);
@@ -67,11 +102,10 @@ function getTestSoundPath(extDir, settings) {
 
 const Indicator = GObject.registerClass(
 class MechKeysIndicator extends PanelMenu.Button {
-    _init(ext, settings) {
+    _init(ext) {
         super._init(0.0, _('MechKeys'), true);
 
         this._ext = ext;
-        this._settings = settings;
 
         this._icon = new St.Icon({
             icon_name: 'input-keyboard-symbolic',
@@ -79,27 +113,50 @@ class MechKeysIndicator extends PanelMenu.Button {
         });
         this.add_child(this._icon);
 
-        this._switch = new PopupMenu.PopupSwitchMenuItem(_('Keyboard sounds'), true);
+        this._switch = new PopupMenu.PopupSwitchMenuItem(_('Keyboard sounds'), false);
         this._switchId = this._switch.connect('toggled', (_o, state) => {
-            state ? ext.startDaemon() : ext.stopDaemon();
+            ext.setRunning(state);
         });
         this.menu.addMenuItem(this._switch);
+
+        this._statusItem = new PopupMenu.PopupMenuItem(_('Checking daemon…'));
+        this._statusItem.reactive = false;
+        this.menu.addMenuItem(this._statusItem);
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         const test = new PopupMenu.PopupMenuItem(_('Test click'));
-        test.connect('activate', () => ext.playTest());
+        this._testItem = test;
+        this._testId = test.connect('activate', () => ext.playTest());
         this.menu.addMenuItem(test);
 
         const settingsItem = new PopupMenu.PopupMenuItem(_('Settings…'));
-        settingsItem.connect('activate', () => ext.openPreferences());
+        this._settingsItem = settingsItem;
+        this._settingsId = settingsItem.connect('activate', () => ext.openPreferences());
         this.menu.addMenuItem(settingsItem);
+
+        this.setConnected(false, false);
     }
 
-    setRunning(running) {
-        this._switch?.setToggleState(running);
-        if (this._icon)
-            this._icon.opacity = running ? 255 : 130;
+    setConnected(connected, running) {
+        if (!connected) {
+            this._switch?.setToggleState(false);
+            if (this._switch)
+                this._switch.reactive = false;
+            if (this._statusItem)
+                this._statusItem.label.text = _('Daemon not running');
+            if (this._icon)
+                this._icon.opacity = 130;
+        } else {
+            if (this._switch) {
+                this._switch.reactive = true;
+                this._switch.setToggleState(running);
+            }
+            if (this._statusItem)
+                this._statusItem.label.text = running ? _('Daemon active') : _('Daemon paused');
+            if (this._icon)
+                this._icon.opacity = running ? 255 : 160;
+        }
     }
 
     destroy() {
@@ -109,10 +166,27 @@ class MechKeysIndicator extends PanelMenu.Button {
         }
         this._switch?.destroy();
         this._switch = null;
+
+        if (this._testId && this._testItem) {
+            this._testItem.disconnect(this._testId);
+            this._testId = null;
+        }
+        this._testItem?.destroy();
+        this._testItem = null;
+
+        if (this._settingsId && this._settingsItem) {
+            this._settingsItem.disconnect(this._settingsId);
+            this._settingsId = null;
+        }
+        this._settingsItem?.destroy();
+        this._settingsItem = null;
+
+        this._statusItem?.destroy();
+        this._statusItem = null;
+
         this._icon?.destroy();
         this._icon = null;
         this._ext = null;
-        this._settings = null;
         super.destroy();
     }
 });
@@ -120,76 +194,123 @@ class MechKeysIndicator extends PanelMenu.Button {
 export default class MechKeysExtension extends Extension {
     enable() {
         this._settings = this.getSettings('org.gnome.shell.extensions.mechkeys');
-        this._daemon = null;
-        this._daemonWaitId = null;
-        this._indicator = new Indicator(this, this._settings);
+        this._indicator = new Indicator(this);
         Main.panel.addToStatusArea('mechkeys', this._indicator);
-        this.startDaemon();
+
+        this._proxy = null;
+        this._ownerNotifyId = null;
+        this._signalId = null;
+        this._settingsChangedId = null;
+
+        this._connectDBus();
+
+        this._settingsChangedId = this._settings.connect('changed', () => {
+            this._onSettingsChanged();
+        });
     }
 
     disable() {
-        this.stopDaemon();
+        if (this._settingsChangedId && this._settings) {
+            this._settings.disconnect(this._settingsChangedId);
+            this._settingsChangedId = null;
+        }
+
+        if (this._proxy) {
+            if (this._ownerNotifyId) {
+                this._proxy.disconnect(this._ownerNotifyId);
+                this._ownerNotifyId = null;
+            }
+            if (this._signalId) {
+                this._proxy.disconnectSignal(this._signalId);
+                this._signalId = null;
+            }
+            this._proxy = null;
+        }
+
         this._indicator?.destroy();
         this._indicator = null;
         this._settings = null;
     }
 
-    startDaemon() {
-        if (this._daemon && !this._daemon.get_if_exited())
-            return;
-        const daemonBin = GLib.find_program_in_path('python3') ?? 'python3';
-        const argv = [
-            daemonBin, '-u',
-            GLib.build_filenamev([this.path, 'mechkeysd.py']),
-            '--sounds-dir', GLib.build_filenamev([this.path, 'sounds']),
-            '--schemadir', GLib.build_filenamev([this.path, 'schemas']),
-            '--schema', 'org.gnome.shell.extensions.mechkeys',
-        ];
+    _connectDBus() {
         try {
-            this._daemon = new Gio.Subprocess({
-                argv,
-                flags: Gio.SubprocessFlags.NONE,
-            });
-            this._daemon.init(null);
-            this._daemonWaitId = this._daemon.connect('wait', (_sub, _result) => {
-                this._daemonWaitId = null;
-                const status = this._daemon ? this._daemon.get_exit_status() : 0;
-                if (status === PERM_EXIT_CODE) {
-                    Main.notify(_('MechKeys needs keyboard access'),
-                        _('Run “sudo usermod -aG input $USER” in a terminal, then log out and back in.'));
+            this._proxy = new MechKeysProxy(
+                Gio.DBus.session,
+                DBUS_NAME,
+                DBUS_PATH,
+                (proxy, error) => {
+                    if (error) {
+                        console.warn(`MechKeys D-Bus connection failed: ${error}`);
+                        this._indicator?.setConnected(false, false);
+                        return;
+                    }
+                    this._ownerNotifyId = proxy.connect('notify::g-name-owner', () => {
+                        this._syncDaemonState();
+                    });
+                    this._signalId = proxy.connectSignal('StatusChanged', (_proxy, _sender, [running]) => {
+                        this._indicator?.setConnected(true, running);
+                    });
+                    this._syncDaemonState();
                 }
-                this._indicator?.setRunning(false);
-            });
-            this._indicator?.setRunning(true);
-        } catch (exc) {
-            this._daemon = null;
-            this._daemonWaitId = null;
-            Main.notify(_('MechKeys could not start'), String(exc));
+            );
+        } catch (e) {
+            console.warn(`MechKeys proxy init error: ${e}`);
+            this._indicator?.setConnected(false, false);
         }
     }
 
-    stopDaemon() {
-        const daemon = this._daemon;
-        this._daemon = null;
-        if (daemon) {
-            if (this._daemonWaitId) {
-                daemon.disconnect(this._daemonWaitId);
-                this._daemonWaitId = null;
-            }
-            if (!daemon.get_if_exited()) {
-                daemon.send_signal(GLib.ProcessSignal.TERM);
-            }
+    _syncDaemonState() {
+        if (!this._proxy || !this._proxy.g_name_owner) {
+            this._indicator?.setConnected(false, false);
+            return;
         }
-        this._indicator?.setRunning(false);
+        this._proxy.GetStatusRemote((result, error) => {
+            if (error) {
+                this._indicator?.setConnected(false, false);
+            } else {
+                const [running] = result;
+                this._indicator?.setConnected(true, running);
+            }
+        });
+    }
+
+    setRunning(state) {
+        if (this._proxy && this._proxy.g_name_owner) {
+            this._proxy.SetRunningRemote(state, (_result, error) => {
+                if (error)
+                    console.warn(`MechKeys SetRunning error: ${error}`);
+            });
+        } else {
+            this._indicator?.setConnected(false, false);
+            Main.notify(_('MechKeys daemon is not running'),
+                _('Run "mechkeysd" or install with: pip install mechkeys'));
+        }
     }
 
     playTest() {
+        if (this._proxy && this._proxy.g_name_owner) {
+            this._proxy.PlayTestRemote((_result, error) => {
+                if (error)
+                    this._playLocalTest();
+            });
+        } else {
+            this._playLocalTest();
+        }
+    }
+
+    _onSettingsChanged() {
+        if (this._proxy && this._proxy.g_name_owner) {
+            this._proxy.ReloadRemote((_result, _error) => {});
+        }
+    }
+
+    _playLocalTest() {
         try {
-            const volume = this._settings.get_double('volume');
+            const volume = this._settings?.get_double('volume') ?? 0.6;
             const path = getTestSoundPath(this.path, this._settings);
             const pw = GLib.find_program_in_path('pw-play') ??
                 GLib.find_program_in_path('paplay');
-            if (!pw)
+            if (!pw || !path)
                 return;
             const proc = new Gio.Subprocess({
                 argv: [pw, '--volume', volume.toFixed(2), path],

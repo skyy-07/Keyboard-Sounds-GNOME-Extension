@@ -13,10 +13,6 @@ const EXT_DIR = GLib.path_get_dirname(
 const PERMISSION_FIX = 'sudo usermod -aG input $USER';
 const AUTOSTART_FILE = 'mechkeys@skyy-07.github.io.desktop';
 
-function shquote(path) {
-    return `"${path.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
-}
-
 function writeAutostart(enable) {
     const dir = GLib.build_filenamev([GLib.get_user_config_dir(), 'autostart']);
     const file = GLib.build_filenamev([dir, AUTOSTART_FILE]);
@@ -28,20 +24,13 @@ function writeAutostart(enable) {
         }
         return;
     }
-    const daemon = GLib.build_filenamev([EXT_DIR, 'mechkeysd.py']);
-    const exec = [
-        '/usr/bin/python3', '-u',
-        shquote(daemon),
-        '--sounds-dir', shquote(GLib.build_filenamev([EXT_DIR, 'sounds'])),
-        '--schemadir', shquote(GLib.build_filenamev([EXT_DIR, 'schemas'])),
-        '--schema', 'org.gnome.shell.extensions.mechkeys',
-    ].join(' ');
+    const bin = GLib.find_program_in_path('mechkeysd') ?? 'mechkeysd';
     const contents = [
         '[Desktop Entry]',
         'Type=Application',
-        'Name=MechKeys',
-        'Comment=Mechanical keyboard sounds on every keystroke',
-        `Exec=${exec}`,
+        'Name=MechKeys Daemon',
+        'Comment=Mechanical keyboard sounds daemon',
+        `Exec=${bin}`,
         'X-GNOME-Autostart-enabled=true',
         'NoDisplay=true',
         '',
@@ -143,29 +132,80 @@ function getTestSoundPath(extDir, settings) {
     return GLib.build_filenamev([extDir, 'sounds', 'thock', 'press-1.wav']);
 }
 
-function importPackViaPython(sourcePath, extDir, callback) {
-    const daemonBin = GLib.find_program_in_path('python3') ?? 'python3';
-    const script = GLib.build_filenamev([extDir, 'mechkeysd.py']);
-    try {
-        const proc = new Gio.Subprocess({
-            argv: [daemonBin, script, '--import-pack', sourcePath],
-            flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
-        });
-        proc.init(null);
-        proc.communicate_utf8_async(null, null, (_p, res) => {
-            try {
-                const [, stdout, stderr] = proc.communicate_utf8_finish(res);
-                if (proc.get_successful()) {
-                    callback(null, (stdout || '').trim());
-                } else {
-                    callback(new Error((stderr || '').trim() || _('Import failed')));
+function importPackArchive(sourcePath, callback) {
+    const packsDir = GLib.build_filenamev(
+        [GLib.get_user_data_dir() || GLib.get_home_dir(), 'mechkeys', 'packs']);
+    GLib.mkdir_with_parents(packsDir, 0o755);
+
+    const baseName = GLib.path_get_basename(sourcePath).replace(/\.[^/.]+$/, '');
+    const safeName = baseName.replace(/[^a-zA-Z0-9._-]/g, '_') || 'custom_pack';
+    const targetDir = GLib.build_filenamev([packsDir, safeName]);
+
+    const mechkeysd = GLib.find_program_in_path('mechkeysd');
+    if (mechkeysd) {
+        try {
+            const proc = new Gio.Subprocess({
+                argv: [mechkeysd, '--import-pack', sourcePath],
+                flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+            });
+            proc.init(null);
+            proc.communicate_utf8_async(null, null, (_p, res) => {
+                try {
+                    const [, stdout, stderr] = proc.communicate_utf8_finish(res);
+                    if (proc.get_successful()) {
+                        callback(null, (stdout || '').trim() || safeName);
+                    } else {
+                        callback(new Error((stderr || '').trim() || _('Import failed')));
+                    }
+                } catch (e) {
+                    callback(e);
                 }
-            } catch (e) {
-                callback(e);
-            }
-        });
-    } catch (e) {
-        callback(e);
+            });
+            return;
+        } catch {}
+    }
+
+    if (sourcePath.toLowerCase().endsWith('.zip')) {
+        const unzip = GLib.find_program_in_path('unzip');
+        if (!unzip) {
+            callback(new Error(_('unzip program not found')));
+            return;
+        }
+        GLib.mkdir_with_parents(targetDir, 0o755);
+        try {
+            const proc = new Gio.Subprocess({
+                argv: [unzip, '-q', '-o', sourcePath, '-d', targetDir],
+                flags: Gio.SubprocessFlags.NONE,
+            });
+            proc.init(null);
+            proc.wait_async(null, () => {
+                if (proc.get_successful())
+                    callback(null, safeName);
+                else
+                    callback(new Error(_('Failed to extract zip archive')));
+            });
+        } catch (e) {
+            callback(e);
+        }
+    } else if (GLib.file_test(sourcePath, GLib.FileTest.IS_DIR)) {
+        const cp = GLib.find_program_in_path('cp') ?? 'cp';
+        try {
+            const proc = new Gio.Subprocess({
+                argv: [cp, '-r', sourcePath, targetDir],
+                flags: Gio.SubprocessFlags.NONE,
+            });
+            proc.init(null);
+            proc.wait_async(null, () => {
+                if (proc.get_successful())
+                    callback(null, safeName);
+                else
+                    callback(new Error(_('Failed to copy sound directory')));
+            });
+        } catch (e) {
+            callback(e);
+        }
+    } else {
+        callback(new Error(_('Unsupported file type')));
     }
 }
 
@@ -176,6 +216,7 @@ export default class MechKeysPreferences extends ExtensionPreferences {
         const page = new Adw.PreferencesPage();
         window.add(page);
 
+        page.add(this._daemonGroup(window));
         page.add(this._soundGroup(settings));
         page.add(this._capsuleGroup(settings, window));
         page.add(this._feelGroup(settings));
@@ -183,10 +224,59 @@ export default class MechKeysPreferences extends ExtensionPreferences {
         page.add(this._setupGroup(window));
     }
 
+    _daemonGroup(window) {
+        const group = new Adw.PreferencesGroup({
+            title: _('Daemon & Service'),
+            description: _('MechKeys sound daemon runs outside GNOME Shell and communicates via D-Bus (io.github.skyy07.MechKeys)'),
+        });
+
+        const statusRow = new Adw.ActionRow({
+            title: _('D-Bus connection status'),
+            subtitle: _('Checking…'),
+        });
+
+        const copyBtn = new Gtk.Button({
+            label: _('Copy install cmd'),
+            valign: Gtk.Align.CENTER,
+            css_classes: ['flat'],
+        });
+        copyBtn.connect('clicked', () => {
+            const cmd = 'pip install mechkeys && mechkeysd';
+            try {
+                Gdk.Display.get_default().get_clipboard().set_text(cmd);
+            } catch {}
+            window.add_toast(new Adw.Toast({title: _('Command copied')}));
+        });
+
+        const checkStatus = () => {
+            try {
+                const proxy = new Gio.DBusProxy({
+                    g_connection: Gio.DBus.session,
+                    g_name: 'io.github.skyy07.MechKeys',
+                    g_object_path: '/io/github/skyy07/MechKeys',
+                    g_interface_name: 'io.github.skyy07.MechKeys',
+                });
+                proxy.init(null);
+                if (proxy.g_name_owner) {
+                    statusRow.subtitle = _('Connected & active on D-Bus (io.github.skyy07.MechKeys)');
+                } else {
+                    statusRow.subtitle = _('Not running. Run "mechkeysd" in terminal or install with pip');
+                }
+            } catch {
+                statusRow.subtitle = _('Not running. Run "mechkeysd" in terminal or install with pip');
+            }
+        };
+
+        statusRow.add_suffix(copyBtn);
+        group.add(statusRow);
+        checkStatus();
+
+        return group;
+    }
+
     _soundGroup(settings) {
         const group = new Adw.PreferencesGroup({title: _('Sound')});
 
-        // -- sound profile ------------------------------------------
         const profiles = ['thock', 'clack', 'creamy', 'pack'];
         const labels = ['Thock (deep & rounded)', 'Clack (bright & snappy)',
             'Creamy (soft & muted)', 'Custom capsule (user sound pack)'];
@@ -213,11 +303,9 @@ export default class MechKeysPreferences extends ExtensionPreferences {
         const profileChanged = () => applyProfileKey();
         settings.connect('changed::profile', profileChanged);
 
-        // -- volume --------------------------------------------------
         group.add(this._bindSpinDouble(settings, 'volume', _('Volume'),
             _('Loudness of every keystroke'), 1, 100, 100));
 
-        // -- toggles -------------------------------------------------
         const variation = new Adw.SwitchRow({
             title: _('Random pitch variation'),
             subtitle: _('Six subtly detuned variants, picked per press'),
@@ -295,7 +383,6 @@ export default class MechKeysPreferences extends ExtensionPreferences {
 
         rebuildModel();
 
-        // -- Open Folder ActionRow ------------------------------------
         const openFolderRow = new Adw.ActionRow({
             title: _('Capsules folder'),
             subtitle: packsDir + _(' — drop sound folders here'),
@@ -329,7 +416,6 @@ export default class MechKeysPreferences extends ExtensionPreferences {
         openFolderRow.add_suffix(openBtn);
         group.add(openFolderRow);
 
-        // -- Import ActionRow -----------------------------------------
         const importRow = new Adw.ActionRow({
             title: _('Import sound capsule'),
             subtitle: _('Extract a .zip archive or copy a sound folder'),
@@ -354,7 +440,7 @@ export default class MechKeysPreferences extends ExtensionPreferences {
                     const file = source.open_finish(result);
                     const path = file.get_path();
                     if (path) {
-                        importPackViaPython(path, EXT_DIR, (err, name) => {
+                        importPackArchive(path, (err, name) => {
                             if (!err && name) {
                                 settings.set_string('pack-name', name);
                                 settings.set_string('profile', 'pack');
@@ -393,7 +479,7 @@ export default class MechKeysPreferences extends ExtensionPreferences {
                     const folder = source.select_folder_finish(result);
                     const path = folder.get_path();
                     if (path) {
-                        importPackViaPython(path, EXT_DIR, (err, name) => {
+                        importPackArchive(path, (err, name) => {
                             if (!err && name) {
                                 settings.set_string('pack-name', name);
                                 settings.set_string('profile', 'pack');
@@ -422,7 +508,6 @@ export default class MechKeysPreferences extends ExtensionPreferences {
         importRow.add_suffix(importFolderBtn);
         group.add(importRow);
 
-        // -- Manual folder name EntryRow ------------------------------
         group.add(this._bindString(settings, 'pack-name',
             _('Capsule folder name'),
             _('Folder name inside ~/.local/share/mechkeys/packs/'),

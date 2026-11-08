@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mechkeys"
+version = "0.2.0"
+description = "Mechanical keyboard sounds daemon for GNOME/Wayland on Linux"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "GPL-3.0-or-later" }
+authors = [
+    { name = "skyy-07" }
+]
+keywords = ["mechanical-keyboard", "audio", "gnome", "wayland", "sound", "keyboard"]
+classifiers = [
+    "Environment :: X11 Applications :: Gnome",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+dependencies = [
+    # PyGObject is provided by system python3-gi on GNOME/Ubuntu systems
+]
+
+[project.optional-dependencies]
+pygobject = ["PyGObject>=3.36.0"]
+
+[project.urls]
+Homepage = "https://github.com/skyy-07/Keyboard-Sounds-GNOME-Extension"
+Issues = "https://github.com/skyy-07/Keyboard-Sounds-GNOME-Extension/issues"
+
+[project.scripts]
+mechkeysd = "mechkeys.daemon:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mechkeys*"]

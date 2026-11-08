@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
 """MechKeys daemon.
 
-Reads key events for every attached keyboard directly from /dev/input and
-plays a short synthesized mechanical-keyboard click on each press. This
-kernel-level window is the only reliable way to see keystrokes on Wayland,
-where desktop applications (and GNOME Shell extensions) cannot observe keys
-from unfocused windows.
-
-Zero third-party dependencies: pure standard library + gobject introspection
-(python3-gi, preinstalled on all GNOME systems) for reading your settings.
-
-Exit codes:
-    0  clean exit
-    12 no readable keyboard devices (user is not in the 'input' group)
+Reads key events directly from /dev/input and plays short mechanical-keyboard
+sounds on each keystroke. Operates as a standalone service communicating with
+the GNOME Shell extension (or other clients) over D-Bus (io.github.skyy07.MechKeys).
 """
 
 import argparse
@@ -20,7 +11,6 @@ import fcntl
 import json
 import os
 import random
-import selectors
 import shutil
 import signal
 import struct
@@ -29,23 +19,21 @@ import sys
 import time
 import zipfile
 
+import gi
+gi.require_version('Gio', '2.0')
+gi.require_version('GLib', '2.0')
+from gi.repository import Gio, GLib
+
 EV_KEY = 1
 EV_REL = 2
 EV_ABS = 3
 
-# struct input_event on 64-bit Linux: 2 x timeval quads, u16 type, u16 code, s32 value
 EVENT_FMT = '=QQHHi'
 EVENT_SIZE = struct.calcsize(EVENT_FMT)
 
-# standard keyboard codes live below BTN_MOUSE (0x110); higher codes are
-# mice, touchpads, joysticks, etc. and must not make keyboard sounds.
 KEY_MAX_PLAIN = 0x110
-
-# which repeats to skip when damping (avoid hammering the process spawner)
 REPEAT_MIN_INTERVAL = 0.045
 
-# evdev key codes -> JavaScript KeyboardEvent.code names (MechVibes packs use
-# these as file/config keys). Covers the standard 104-key layout.
 KEY_CODE_NAME = {
     1: 'Escape', 2: 'Digit1', 3: 'Digit2', 4: 'Digit3', 5: 'Digit4',
     6: 'Digit5', 7: 'Digit6', 8: 'Digit7', 9: 'Digit8', 10: 'Digit9',
@@ -71,28 +59,50 @@ KEY_CODE_NAME = {
     76: 'Numpad5', 77: 'Numpad6', 79: 'Numpad1', 80: 'Numpad2', 81: 'Numpad3',
     86: 'Backslash', 152: 'NumpadComma',
 }
-# synthetic key-name for unnamed/extra keys
 KEY_FALLBACK_NAMES = ('Enter', 'Space', 'KeyA', 'KeyS', 'KeyD', 'KeyF')
-
 
 AUDIO_EXTENSIONS = ('.wav', '.ogg', '.flac', '.mp3')
 
+DBUS_INTERFACE_XML = '''
+<node>
+  <interface name="io.github.skyy07.MechKeys">
+    <method name="GetStatus">
+      <arg type="b" name="running" direction="out"/>
+      <arg type="s" name="profile" direction="out"/>
+      <arg type="d" name="volume" direction="out"/>
+    </method>
+    <method name="SetRunning">
+      <arg type="b" name="running" direction="in"/>
+    </method>
+    <method name="PlayTest">
+    </method>
+    <method name="Reload">
+    </method>
+    <method name="ImportPack">
+      <arg type="s" name="path" direction="in"/>
+      <arg type="s" name="name" direction="out"/>
+    </method>
+    <method name="ListPacks">
+      <arg type="s" name="json_packs" direction="out"/>
+    </method>
+    <method name="Quit">
+    </method>
+    <signal name="StatusChanged">
+      <arg type="b" name="running"/>
+    </signal>
+  </interface>
+</node>
+'''
+
 
 class SoundPack:
-    """Supports both MechVibes-style packs and loose-audio custom sound capsules.
-
-    1. MechVibes packs: config.json + concatenated audio (or discrete files).
-       Slices audio into per-key WAVs under ~/.cache/mechkeys/packs/<name>/ once.
-    2. Custom audio capsules: A folder containing audio files (e.g. press.wav,
-       space.wav, click-1.wav, etc.). Maps named keys or picks randomly from
-       available sounds.
-    """
+    """Supports both MechVibes-style packs and loose-audio custom sound capsules."""
 
     def __init__(self, pack_dir, cache_dir):
         self.ok = False
-        self.files = {}          # key_name -> list of file paths
-        self.generic_press = []  # fallback press files
-        self.generic_release = []# fallback release files
+        self.files = {}
+        self.generic_press = []
+        self.generic_release = []
         self.pack_name = os.path.basename(pack_dir.rstrip(os.sep))
 
         if not os.path.isdir(pack_dir):
@@ -104,7 +114,6 @@ class SoundPack:
                 self.ok = True
                 return
 
-        # If no config.json or MechVibes load failed, try loading as a loose sound capsule
         if self._load_audio_capsule(pack_dir):
             self.ok = True
 
@@ -160,7 +169,6 @@ class SoundPack:
             for key, takes in variants.items()
         }
 
-        # Check if cache is already complete
         all_exist = all(os.path.isfile(p) for flist in self.files.values() for p in flist)
         if all_exist:
             self._fill_generic_from_files()
@@ -191,7 +199,6 @@ class SoundPack:
         return True
 
     def _load_audio_capsule(self, pack_dir):
-        """Load loose audio files from a sound capsule folder."""
         found_files = []
         for root, _, files in os.walk(pack_dir):
             for f in sorted(files):
@@ -267,88 +274,6 @@ class SoundPack:
         return None
 
 
-def import_pack(source_path):
-    """Import a .zip archive or directory into ~/.local/share/mechkeys/packs/."""
-    source_path = os.path.expanduser(source_path)
-    if not os.path.exists(source_path):
-        print(f"Error: {source_path} does not exist", file=sys.stderr)
-        return None
-
-    data_home = os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
-    dest_base = os.path.join(data_home, 'mechkeys', 'packs')
-    os.makedirs(dest_base, exist_ok=True)
-
-    base_name = os.path.splitext(os.path.basename(source_path.rstrip(os.sep)))[0]
-    safe_name = "".join(c if (c.isalnum() or c in '._- ') else '_' for c in base_name).strip() or "custom_pack"
-    target_dir = os.path.join(dest_base, safe_name)
-
-    if os.path.isfile(source_path):
-        if not zipfile.is_zipfile(source_path):
-            if source_path.lower().endswith(AUDIO_EXTENSIONS):
-                os.makedirs(target_dir, exist_ok=True)
-                shutil.copy2(source_path, target_dir)
-                return safe_name
-            print(f"Error: {source_path} is not a valid zip archive or audio file", file=sys.stderr)
-            return None
-
-        with zipfile.ZipFile(source_path, 'r') as z:
-            top_levels = {p.split('/')[0] for p in z.namelist() if p and not p.startswith('/')}
-            has_root_files = any('/' not in p and p for p in z.namelist() if not p.endswith('/'))
-            if len(top_levels) == 1 and not has_root_files:
-                inner_dir = list(top_levels)[0]
-                temp_extract = os.path.join(dest_base, f".tmp_{safe_name}")
-                if os.path.exists(temp_extract):
-                    shutil.rmtree(temp_extract)
-                z.extractall(temp_extract)
-                extracted_root = os.path.join(temp_extract, inner_dir)
-                if os.path.exists(target_dir):
-                    shutil.rmtree(target_dir)
-                shutil.move(extracted_root, target_dir)
-                shutil.rmtree(temp_extract, ignore_errors=True)
-            else:
-                if os.path.exists(target_dir):
-                    shutil.rmtree(target_dir)
-                os.makedirs(target_dir, exist_ok=True)
-                z.extractall(target_dir)
-        return safe_name
-
-    elif os.path.isdir(source_path):
-        if os.path.abspath(source_path) == os.path.abspath(target_dir):
-            return safe_name
-        if os.path.exists(target_dir):
-            shutil.rmtree(target_dir)
-        shutil.copytree(source_path, target_dir)
-        return safe_name
-
-    return None
-
-
-def list_packs():
-    """List all sound packs / capsules installed under ~/.local/share/mechkeys/packs/."""
-    data_home = os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
-    packs_dir = os.path.join(data_home, 'mechkeys', 'packs')
-    results = []
-    if os.path.isdir(packs_dir):
-        for entry in sorted(os.listdir(packs_dir)):
-            if entry.startswith('.'):
-                continue
-            full_path = os.path.join(packs_dir, entry)
-            if not os.path.isdir(full_path):
-                continue
-            info = {"id": entry, "path": full_path, "name": entry, "type": "audio_capsule"}
-            cfg_path = os.path.join(full_path, "config.json")
-            if os.path.isfile(cfg_path):
-                try:
-                    with open(cfg_path, "r", encoding="utf-8") as f:
-                        cfg = json.load(f)
-                    info["name"] = cfg.get("name") or entry
-                    info["type"] = "mechvibes"
-                except Exception:
-                    pass
-            results.append(info)
-    return results
-
-
 def _ioc(direction, size, t, nr):
     return (direction << 30) | (size << 16) | (t << 8) | nr
 
@@ -375,10 +300,9 @@ def bit_set(buf, bit):
 
 
 def is_keyboard(fd):
-    """Best-effort keyboard detection: has key events, but no REL/ABS axes."""
     ev = get_bitmap(fd, 0, 32)
     if ev is None:
-        return True  # can't introspect; assume keyboard
+        return True
     if not bit_set(ev, EV_KEY):
         return False
     if bit_set(ev, EV_REL) or bit_set(ev, EV_ABS):
@@ -386,12 +310,11 @@ def is_keyboard(fd):
     keys = get_bitmap(fd, 1, 128)
     if keys is None:
         return True
-    # real typing keyboards: check a few letter keys (Q=16, E=18, S=31, C=46)
     return any(bit_set(keys, k) for k in (16, 18, 30, 31, 46, 57))
 
 
 def get_name(fd):
-    buf = bytearray(128)
+    buf = bytearray(256)
     try:
         fcntl.ioctl(fd, _ior(0x45, 0x06, len(buf)), buf)
     except OSError:
@@ -400,7 +323,7 @@ def get_name(fd):
 
 
 class Args:
-    """Snapshot of settings, refreshed live from GSettings (or fallbacks)."""
+    """Live snapshot of settings from GSettings with fallbacks."""
 
     FALLBACK = {
         'volume': 0.6, 'profile': 'thock', 'pack-name': 'r1-36ef0a69',
@@ -409,20 +332,36 @@ class Args:
         'release-sound': True, 'release-volume': 0.45,
     }
 
-    def __init__(self, args):
-        self._args = args
+    def __init__(self, schemadir=None, schema_id='org.gnome.shell.extensions.mechkeys'):
         self._s = None
-        try:
-            from gi.repository import Gio
-            if args.schemadir:
-                src = Gio.SettingsSchemaSource.new_from_directory(
-                    args.schemadir, Gio.SettingsSchemaSource.get_default(), False)
-                schema = src.lookup(args.schema, True)
-                if schema is not None:
-                    self._s = Gio.Settings.new_full(schema, None, None)
-        except Exception as exc:  # cannot read settings; run with defaults
-            print(f'settings unavailable ({exc}); using built-in defaults',
-                  file=sys.stderr)
+        candidates = []
+        if schemadir:
+            candidates.append(schemadir)
+        candidates.extend([
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'mechkeys@skyy-07.github.io', 'schemas'),
+            os.path.expanduser('~/.local/share/gnome-shell/extensions/mechkeys@skyy-07.github.io/schemas'),
+            os.path.expanduser('~/.local/share/glib-2.0/schemas'),
+            '/usr/share/glib-2.0/schemas',
+        ])
+        for c in candidates:
+            if os.path.isdir(c) and os.path.isfile(os.path.join(c, 'gschemas.compiled')):
+                try:
+                    src = Gio.SettingsSchemaSource.new_from_directory(
+                        c, Gio.SettingsSchemaSource.get_default(), False)
+                    schema = src.lookup(schema_id, True)
+                    if schema is not None:
+                        self._s = Gio.Settings.new_full(schema, None, None)
+                        break
+                except Exception:
+                    pass
+        if self._s is None:
+            try:
+                schema_source = Gio.SettingsSchemaSource.get_default()
+                if schema_source and schema_source.lookup(schema_id, True):
+                    self._s = Gio.Settings.new(schema_id)
+            except Exception as exc:
+                print(f'GSettings unavailable ({exc}); using built-in defaults', file=sys.stderr)
+
         for k in self.FALLBACK:
             self._setattr(k)
 
@@ -448,11 +387,13 @@ class Args:
     def connect(self, on_change=None):
         if self._s is None:
             return
+
         def refresh(*_a):
             for k in self.FALLBACK:
                 self._setattr(k)
             if on_change:
                 on_change()
+
         self._s.connect('changed', refresh)
 
 
@@ -471,12 +412,10 @@ class Player:
         self.reload_pack()
 
     def reload_pack(self):
-        """(Re)load a custom sound capsule / MechVibes pack."""
         self.pack = None
         if getattr(self.a, 'profile', '') != 'pack':
             return
-        data_home = os.environ.get('XDG_DATA_HOME') or os.path.expanduser(
-            '~/.local/share')
+        data_home = os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
         pack_name = getattr(self.a, 'pack_name', '').strip()
         packs_base = os.path.join(data_home, 'mechkeys', 'packs')
 
@@ -486,7 +425,6 @@ class Player:
         elif pack_name:
             pack_dir = os.path.join(packs_base, pack_name)
 
-        # Fallback to any installed pack if specified pack doesn't exist
         if (not pack_dir or not os.path.isdir(pack_dir)) and os.path.isdir(packs_base):
             for e in sorted(os.listdir(packs_base)):
                 p = os.path.join(packs_base, e)
@@ -502,8 +440,7 @@ class Player:
             if self.pack.ok:
                 return
 
-        print('Sound capsule not found/invalid; falling back to synthesized "thock" sounds',
-              file=sys.stderr)
+        print('Capsule not found/invalid; falling back to synthesized "thock" sounds', file=sys.stderr)
         self.pack = None
 
     def _pick_path(self, code, press):
@@ -516,13 +453,12 @@ class Player:
                     return self.pack.pick(code, is_release=False)
                 if press:
                     return self.pack.pick(code, is_release=False)
-            # If pack failed or missing, fall through to synthesized sounds
+
         if not press and not self.a.release_sound:
             return None
+
         kind_file = ('space' if (press and self.a.space_sound and
                                  code == 0x39) else 'press')
-        if not press:  # releases reuse the press sample, quieter
-            kind_file = 'space' if kind_file == 'space' else 'press'
         variant = random.randint(1, 6) if self.a.pitch_variation else 1
         path = os.path.join(self.sounds_dir, self.a.profile
                             if self.a.profile != 'pack' else 'thock',
@@ -558,9 +494,9 @@ class Player:
         if os.path.basename(self.binary) == 'pw-play':
             argv.extend(['--latency', '10ms'])
         argv.append(path)
-        # recycle finished players
+
         self.players = [p for p in self.players if p.poll() is None]
-        if len(self.players) >= 10:  # too much already in flight
+        if len(self.players) >= 10:
             return
         try:
             self.players.append(subprocess.Popen(
@@ -568,9 +504,303 @@ class Player:
         except OSError as exc:
             print(f'playback failed: {exc}', file=sys.stderr)
 
+    def play_test(self):
+        path = self._pick_path(30, press=True)
+        if not path or not os.path.isfile(path):
+            path = os.path.join(self.sounds_dir, 'thock', 'press-1.wav')
+        if not os.path.isfile(path):
+            return
+        argv = [self.binary, '--volume', f'{self.a.volume:.4f}']
+        if os.path.basename(self.binary) == 'pw-play':
+            argv.extend(['--latency', '10ms'])
+        argv.append(path)
+        try:
+            subprocess.Popen(argv, stdout=self.devnull, stderr=self.devnull)
+        except OSError:
+            pass
+
+
+def import_pack(source_path):
+    source_path = os.path.expanduser(source_path)
+    if not os.path.exists(source_path):
+        return None
+
+    data_home = os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
+    dest_base = os.path.join(data_home, 'mechkeys', 'packs')
+    os.makedirs(dest_base, exist_ok=True)
+
+    base_name = os.path.splitext(os.path.basename(source_path.rstrip(os.sep)))[0]
+    safe_name = "".join(c if (c.isalnum() or c in '._- ') else '_' for c in base_name).strip() or "custom_pack"
+    target_dir = os.path.join(dest_base, safe_name)
+
+    if os.path.isfile(source_path):
+        if not zipfile.is_zipfile(source_path):
+            if source_path.lower().endswith(AUDIO_EXTENSIONS):
+                os.makedirs(target_dir, exist_ok=True)
+                shutil.copy2(source_path, target_dir)
+                return safe_name
+            return None
+
+        with zipfile.ZipFile(source_path, 'r') as z:
+            top_levels = {p.split('/')[0] for p in z.namelist() if p and not p.startswith('/')}
+            has_root_files = any('/' not in p and p for p in z.namelist() if not p.endswith('/'))
+            if len(top_levels) == 1 and not has_root_files:
+                inner_dir = list(top_levels)[0]
+                temp_extract = os.path.join(dest_base, f".tmp_{safe_name}")
+                if os.path.exists(temp_extract):
+                    shutil.rmtree(temp_extract)
+                z.extractall(temp_extract)
+                extracted_root = os.path.join(temp_extract, inner_dir)
+                if os.path.exists(target_dir):
+                    shutil.rmtree(target_dir)
+                shutil.move(extracted_root, target_dir)
+                shutil.rmtree(temp_extract, ignore_errors=True)
+            else:
+                if os.path.exists(target_dir):
+                    shutil.rmtree(target_dir)
+                os.makedirs(target_dir, exist_ok=True)
+                z.extractall(target_dir)
+        return safe_name
+
+    elif os.path.isdir(source_path):
+        if os.path.abspath(source_path) == os.path.abspath(target_dir):
+            return safe_name
+        if os.path.exists(target_dir):
+            shutil.rmtree(target_dir)
+        shutil.copytree(source_path, target_dir)
+        return safe_name
+
+    return None
+
+
+def list_packs():
+    data_home = os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
+    packs_dir = os.path.join(data_home, 'mechkeys', 'packs')
+    results = []
+    if os.path.isdir(packs_dir):
+        for entry in sorted(os.listdir(packs_dir)):
+            if entry.startswith('.'):
+                continue
+            full_path = os.path.join(packs_dir, entry)
+            if not os.path.isdir(full_path):
+                continue
+            info = {"id": entry, "path": full_path, "name": entry, "type": "audio_capsule"}
+            cfg_path = os.path.join(full_path, "config.json")
+            if os.path.isfile(cfg_path):
+                try:
+                    with open(cfg_path, "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    info["name"] = cfg.get("name") or entry
+                    info["type"] = "mechvibes"
+                except Exception:
+                    pass
+            results.append(info)
+    return results
+
+
+class MechKeysService:
+    def __init__(self, sounds_dir, args_obj, debug=False):
+        self.sounds_dir = sounds_dir
+        self.a = args_obj
+        self.debug = debug
+        self.running = True
+        self.connection = None
+        self.player = Player(sounds_dir, self.a)
+        self.a.connect(self.player.reload_pack)
+
+        self.watch_ids = {}
+        self.leftovers = {}
+        self.loop = GLib.MainLoop()
+
+        node_info = Gio.DBusNodeInfo.new_for_xml(DBUS_INTERFACE_XML)
+        self.interface_info = node_info.interfaces[0]
+
+    def emit_status_changed(self):
+        if self.connection:
+            try:
+                self.connection.emit_signal(
+                    None,
+                    '/io/github/skyy07/MechKeys',
+                    'io.github.skyy07.MechKeys',
+                    'StatusChanged',
+                    GLib.Variant('(b)', (self.running,))
+                )
+            except Exception as exc:
+                if self.debug:
+                    print(f'Signal emission failed: {exc}', file=sys.stderr)
+
+    def handle_method_call(self, connection, sender, object_path, interface_name, method_name, parameters, invocation):
+        if self.debug:
+            print(f'D-Bus call: {method_name}', file=sys.stderr)
+
+        if method_name == 'GetStatus':
+            invocation.return_value(GLib.Variant(
+                '(bsd)',
+                (self.running, getattr(self.a, 'profile', 'thock'), float(getattr(self.a, 'volume', 0.6)))
+            ))
+        elif method_name == 'SetRunning':
+            (new_state,) = parameters.unpack()
+            self.running = bool(new_state)
+            self.emit_status_changed()
+            invocation.return_value(None)
+        elif method_name == 'PlayTest':
+            self.player.play_test()
+            invocation.return_value(None)
+        elif method_name == 'Reload':
+            self.player.reload_pack()
+            invocation.return_value(None)
+        elif method_name == 'ImportPack':
+            (path,) = parameters.unpack()
+            name = import_pack(path) or ''
+            if name:
+                self.player.reload_pack()
+            invocation.return_value(GLib.Variant('(s)', (name,)))
+        elif method_name == 'ListPacks':
+            packs_json = json.dumps(list_packs())
+            invocation.return_value(GLib.Variant('(s)', (packs_json,)))
+        elif method_name == 'Quit':
+            invocation.return_value(None)
+            self.loop.quit()
+
+    def on_bus_acquired(self, connection, name):
+        if self.debug:
+            print(f'D-Bus bus acquired: {name}', file=sys.stderr)
+        self.connection = connection
+        connection.register_object(
+            '/io/github/skyy07/MechKeys',
+            self.interface_info,
+            self.handle_method_call,
+            None,
+            None
+        )
+
+    def on_name_acquired(self, connection, name):
+        if self.debug:
+            print(f'D-Bus name acquired: {name}', file=sys.stderr)
+
+    def on_name_lost(self, connection, name):
+        if self.debug:
+            print(f'D-Bus name lost: {name}', file=sys.stderr)
+
+    def on_input_event(self, fd, condition):
+        if condition & (GLib.IOCondition.HUP | GLib.IOCondition.ERR):
+            watch_id = self.watch_ids.pop(fd, None)
+            if watch_id:
+                GLib.source_remove(watch_id)
+            os.close(fd)
+            self.leftovers.pop(fd, None)
+            return False
+
+        try:
+            data = os.read(fd, 1024)
+        except (BlockingIOError, InterruptedError):
+            return True
+        except OSError:
+            watch_id = self.watch_ids.pop(fd, None)
+            if watch_id:
+                GLib.source_remove(watch_id)
+            os.close(fd)
+            self.leftovers.pop(fd, None)
+            return False
+
+        if not data:
+            watch_id = self.watch_ids.pop(fd, None)
+            if watch_id:
+                GLib.source_remove(watch_id)
+            os.close(fd)
+            self.leftovers.pop(fd, None)
+            return False
+
+        buf = self.leftovers.pop(fd, b'') + data
+        n = (len(buf) // EVENT_SIZE) * EVENT_SIZE
+        self.leftovers[fd] = buf[n:]
+        for off in range(0, n, EVENT_SIZE):
+            _tvs, _tvu, etype, code, value = struct.unpack_from(EVENT_FMT, buf, off)
+            if etype != EV_KEY or code >= KEY_MAX_PLAIN:
+                continue
+            if self.running:
+                self.player.play(code, value)
+        return True
+
+    def open_keyboards(self):
+        opened = 0
+        for dev in sorted(os.listdir('/dev/input')):
+            if not dev.startswith('event'):
+                continue
+            path = os.path.join('/dev/input', dev)
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError as exc:
+                if self.debug:
+                    print(f'{path}: cannot open ({exc})', file=sys.stderr)
+                continue
+            if not is_keyboard(fd):
+                os.close(fd)
+                continue
+            watch_id = GLib.io_add_watch(
+                fd,
+                GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR,
+                self.on_input_event
+            )
+            self.watch_ids[fd] = watch_id
+            self.leftovers[fd] = b''
+            opened += 1
+            if self.debug:
+                print(f'{path}: listening ({get_name(fd)})', file=sys.stderr)
+        return opened
+
+    def run(self):
+        Gio.bus_own_name(
+            Gio.BusType.SESSION,
+            'io.github.skyy07.MechKeys',
+            Gio.BusNameOwnerFlags.NONE,
+            self.on_bus_acquired,
+            self.on_name_acquired,
+            self.on_name_lost
+        )
+
+        opened = self.open_keyboards()
+        if opened == 0:
+            print('MechKeys: no readable keyboard devices.', file=sys.stderr)
+            print('Fix: run "sudo usermod -aG input $USER", then log out and back in.', file=sys.stderr)
+            # We still run the main loop so D-Bus commands/requests can explain status or import packs
+        elif self.debug:
+            print(f'MechKeys daemon listening on {opened} keyboard(s)', file=sys.stderr)
+
+        def stop_handler(signum, frame):
+            self.loop.quit()
+
+        signal.signal(signal.SIGTERM, stop_handler)
+        signal.signal(signal.SIGINT, stop_handler)
+
+        try:
+            self.loop.run()
+        finally:
+            for fd, wid in self.watch_ids.items():
+                try:
+                    GLib.source_remove(wid)
+                    os.close(fd)
+                except Exception:
+                    pass
+            self.watch_ids.clear()
+
+
+def resolve_sounds_dir():
+    # 1. User specified or local package data
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sounds'),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'mechkeys@skyy-07.github.io', 'sounds'),
+        os.path.expanduser('~/.local/share/gnome-shell/extensions/mechkeys@skyy-07.github.io/sounds'),
+        '/usr/share/sounds/mechkeys',
+    ]
+    for c in candidates:
+        if os.path.isdir(c) and os.path.isfile(os.path.join(c, 'thock', 'press-1.wav')):
+            return os.path.abspath(c)
+    return candidates[0]
+
 
 def main():
-    ap = argparse.ArgumentParser(description='MechKeys keyboard sound daemon')
+    ap = argparse.ArgumentParser(description='MechKeys mechanical keyboard sounds daemon')
     ap.add_argument('--sounds-dir', default=None)
     ap.add_argument('--schemadir', default=None)
     ap.add_argument('--schema', default='org.gnome.shell.extensions.mechkeys')
@@ -584,90 +814,16 @@ def main():
         sys.exit(0)
 
     if args.import_pack:
-        imported_name = import_pack(args.import_pack)
-        if imported_name:
-            print(imported_name)
+        name = import_pack(args.import_pack)
+        if name:
+            print(name)
             sys.exit(0)
-        else:
-            sys.exit(1)
+        sys.exit(1)
 
-    default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sounds')
-    sounds_dir = args.sounds_dir or default_dir
-
-    a = Args(args)
-    player = Player(sounds_dir, a)
-    a.connect(player.reload_pack)
-
-    # Enumerate & open keyboards.
-    sel = selectors.DefaultSelector()
-    leftovers = {}
-    opened = 0
-    for dev in sorted(os.listdir('/dev/input')):
-        if not dev.startswith('event'):
-            continue
-        path = os.path.join('/dev/input', dev)
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-        except OSError as exc:
-            if args.debug:
-                print(f'{path}: cannot open ({exc})', file=sys.stderr)
-            continue
-        if not is_keyboard(fd):
-            os.close(fd)
-            continue
-        sel.register(fd, selectors.EVENT_READ, path)
-        leftovers[fd] = b''
-        opened += 1
-        if args.debug:
-            print(f'{path}: listening ({get_name(fd)})', file=sys.stderr)
-
-    if opened == 0:
-        print('MechKeys: no readable keyboard devices.', file=sys.stderr)
-        print('Fix: run "sudo usermod -aG input $USER", then log out and back in.',
-              file=sys.stderr)
-        sys.exit(12)
-
-    running = True
-
-    def stop(signum, _frame):
-        nonlocal running
-        running = False
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
-    signal.signal(signal.SIGHUP, stop)
-
-    if args.debug:
-        print(f'daemon running: {opened} keyboard(s)', file=sys.stderr)
-
-    try:
-        while running:
-            for key, _mask in sel.select(timeout=0.25):
-                fd = key.fd
-                try:
-                    data = os.read(fd, 1024)
-                except (BlockingIOError, InterruptedError):
-                    continue
-                except OSError:
-                    sel.unregister(fd)
-                    os.close(fd)
-                    leftovers.pop(fd, None)
-                    continue
-                if not data:  # device detached
-                    sel.unregister(fd)
-                    os.close(fd)
-                    leftovers.pop(fd, None)
-                    continue
-                buf = leftovers.pop(fd, b'') + data
-                n = (len(buf) // EVENT_SIZE) * EVENT_SIZE
-                leftovers[fd] = buf[n:]
-                for off in range(0, n, EVENT_SIZE):
-                    _tvs, _tvu, etype, code, value = struct.unpack_from(
-                        EVENT_FMT, buf, off)
-                    if etype != EV_KEY or code >= KEY_MAX_PLAIN:
-                        continue
-                    player.play(code, value)
-    finally:
-        sel.close()
+    sounds_dir = args.sounds_dir or resolve_sounds_dir()
+    args_obj = Args(schemadir=args.schemadir, schema_id=args.schema)
+    service = MechKeysService(sounds_dir, args_obj, debug=args.debug)
+    service.run()
 
 
 if __name__ == '__main__':
